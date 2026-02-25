@@ -14,7 +14,7 @@ os.environ["RECOMPUTE_LOG_LEVEL"] = "DEBUG"
 from Transformer import *
 from aten_recompute.core.Recom_pass import RecomputePass
 from aten_recompute.get_Aten_IR.Graph_compile_capture import GraphCapture
-from aten_recompute.utils import save_graphmodule_readable
+from aten_recompute.utils import save_ir_and_dot
 
 # ==========================================
 # 初始化模型与数据 (保持你的原逻辑)
@@ -23,7 +23,7 @@ src_vocab_size = 5000
 tgt_vocab_size = 5000
 d_model = 512
 num_heads = 8
-num_layers = 6 
+num_layers = 1
 d_ff = 2048 
 max_seq_length = 100
 dropout = 0.1
@@ -85,19 +85,19 @@ print("\n[3/3] 保存优化后的图到文件...")
 model_name = os.getenv("MODEL_NAME", "Transformer")
 
 # 保存到:
-#   IR_artifacts/<model_name>/recompute/aten_module_FW_recomputed.md
-#   IR_artifacts/<model_name>/recompute/aten_module_BW_recomputed.md
-save_graphmodule_readable(
+#   IR_artifacts/<model_name>/runs/<RUN_ID>/recompute/FW_recomputed.dot
+#   IR_artifacts/<model_name>/runs/<RUN_ID>/recompute/BW_recomputed.dot
+save_ir_and_dot(
     fw_gm_opt,
-    md_path=None,
     model_name=model_name,
     subfolder="recompute",
+    graph_name="FW_recomputed",
 )
-save_graphmodule_readable(
+save_ir_and_dot(
     bw_gm_opt,
-    md_path=None,
     model_name=model_name,
     subfolder="recompute",
+    graph_name="BW_recomputed",
 )
 
 print("全部完成！请在 IR_artifacts 目录下查看该模型对应的重计算图。")
