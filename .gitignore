@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+dist_logs/
+
+# Generated FX / IR artifacts
+Fw_torch_Code.md
+Fw_torch_IR.md
+aten_module_FW*.md
+aten_module_BW*.md
+

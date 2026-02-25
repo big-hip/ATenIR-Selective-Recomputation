@@ -1,56 +1,61 @@
 import logging
 import os
 
-# 确保 logs 目录存在
-LOGS_DIR = "dist_logs"  # 日志目录名称
-os.makedirs(LOGS_DIR, exist_ok=True)  # 如果目录不存在，则创建
+LOGS_DIR = "dist_logs"
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 class CustomFormatter(logging.Formatter):
+    # ... 保持你现有的 CustomFormatter 代码不变 ...
     def format(self, record):
-        # 获取相对路径并转换为模块路径
         record.pathname = self.convert_to_module_path(record.pathname)
         record.module_line = f"{record.pathname}:{record.lineno}"
         return super().format(record)
 
     def convert_to_module_path(self, path):
-        # 将文件路径转换为模块路径
-        base_path = os.path.dirname(__file__)  # 获取当前文件的目录
+        # ... 保持原样 ...
+        base_path = os.path.dirname(__file__)
         relative_path = os.path.relpath(path, start=base_path)
         module_path = relative_path.replace(os.sep, '.').replace('.py', '')
-        # 只保留最后一个文件名部分，并判断文件名前的那一级目录是否是指定的目录
         parts = module_path.split('.')
         if len(parts) > 1 and parts[-2] in ['Data_Parallelism', 'Pipeline_Parallelism', 'Tensor_Parallelism']:
             module_path = '.'.join(parts[-2:])
         else:
             module_path = parts[-1]
-
         module_path = 'Distributed_Parallelism.'+ module_path
         return module_path
 
 def get_logger(module_name, log_file_name=None):
-
-    # 创建日志记录器
     logger = logging.getLogger(module_name)
-    logger.setLevel(logging.INFO)
+    
+    # 核心修改：从环境变量读取日志级别，默认为 INFO
+    log_level_str = os.environ.get("RECOMPUTE_LOG_LEVEL", "INFO").upper()
+    
+    # 将字符串映射为 logging 的内置级别
+    level_mapping = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL
+    }
+    
+    log_level = level_mapping.get(log_level_str, logging.INFO)
+    logger.setLevel(log_level)
 
-    # 设置日志格式，包含模块路径和行号
-    log_format = "%(asctime)s - %(module_line)s - %(levelname)s - %(message)s"
-    formatter = CustomFormatter(log_format)
+    # 避免重复添加 Handler（防止在多次调用 get_logger 时打印重复日志）
+    if not logger.handlers:
+        log_format = "%(asctime)s - %(module_line)s - %(levelname)s - %(message)s"
+        formatter = CustomFormatter(log_format)
 
-    # 添加控制台处理器
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
-    # 如果指定了日志文件名，添加文件处理器
-    if log_file_name:
-        # 确保日志文件保存在 logs 目录下
-        log_file_path = os.path.join(LOGS_DIR, log_file_name)
-        file_handler = logging.FileHandler(log_file_path)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        if log_file_name:
+            log_file_path = os.path.join(LOGS_DIR, log_file_name)
+            file_handler = logging.FileHandler(log_file_path)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
 
-    # 避免日志重复输出
     logger.propagate = False
-
     return logger

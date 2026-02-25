@@ -3,9 +3,9 @@ import torch.fx as fx
 from torch._functorch.aot_autograd import aot_module_simplified
 from functorch.compile import make_boxed_func
 import copy
-import os,sys,io
+import sys, io
 import torch._dynamo as dynamo
-from . import logger
+from .. import logger
 class GraphCapture:
     def __init__(self, model, *input):
         self.FW_gm = fx.GraphModule(torch.nn.Module(), fx.Graph())
@@ -48,7 +48,6 @@ class GraphCapture:
             aten_graph=False,
         )(*self.input)
 
-        node_Rank = 0
         for node in fx_mod.graph.nodes:
             if node.meta.get('stack_trace',None):
                 node.name = node.name 
