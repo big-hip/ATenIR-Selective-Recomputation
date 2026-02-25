@@ -1,5 +1,4 @@
 import os
-import io
 import sys
 
 # 将项目根目录加入 sys.path，保证可以找到 aten_recompute 包
@@ -15,6 +14,7 @@ os.environ["RECOMPUTE_LOG_LEVEL"] = "DEBUG"
 from Transformer import *
 from aten_recompute.core.Recom_pass import RecomputePass
 from aten_recompute.get_Aten_IR.Graph_compile_capture import GraphCapture
+from aten_recompute.utils import save_graphmodule_readable
 
 # ==========================================
 # 初始化模型与数据 (保持你的原逻辑)
@@ -82,20 +82,22 @@ print("重计算 Pass 运行完毕！")
 # ==========================================
 print("\n[3/3] 保存优化后的图到文件...")
 
-with open('aten_module_FW_recomputed.md', 'w') as f:
-    with io.StringIO() as buf:
-        original_stdout = sys.stdout
-        sys.stdout = buf
-        fw_gm_opt.print_readable()
-        sys.stdout = original_stdout
-        f.write(buf.getvalue())
+model_name = os.getenv("MODEL_NAME", "Transformer")
 
-with open('aten_module_BW_recomputed.md', 'w') as f:
-    with io.StringIO() as buf:
-        original_stdout = sys.stdout
-        sys.stdout = buf
-        bw_gm_opt.print_readable()
-        sys.stdout = original_stdout
-        f.write(buf.getvalue())
+# 保存到:
+#   IR_artifacts/<model_name>/recompute/aten_module_FW_recomputed.md
+#   IR_artifacts/<model_name>/recompute/aten_module_BW_recomputed.md
+save_graphmodule_readable(
+    fw_gm_opt,
+    md_path=None,
+    model_name=model_name,
+    subfolder="recompute",
+)
+save_graphmodule_readable(
+    bw_gm_opt,
+    md_path=None,
+    model_name=model_name,
+    subfolder="recompute",
+)
 
-print("全部完成！请检查 aten_module_FW_recomputed.md 和 aten_module_BW_recomputed.md")
+print("全部完成！请在 IR_artifacts 目录下查看该模型对应的重计算图。")

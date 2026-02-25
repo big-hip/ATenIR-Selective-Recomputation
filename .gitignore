@@ -10,11 +10,12 @@ build/
 dist/
 *.egg-info/
 
-# Logs
+# Logs & generated artifacts
 *.log
+IR_artifacts/
 dist_logs/
 
-# Generated FX / IR artifacts
+# Legacy/top-level IR dumps (旧脚本可能仍会生成)
 Fw_torch_Code.md
 Fw_torch_IR.md
 aten_module_FW*.md

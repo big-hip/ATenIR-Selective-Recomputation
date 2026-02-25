@@ -3,9 +3,10 @@ import torch.fx as fx
 from torch._functorch.aot_autograd import aot_module_simplified
 from functorch.compile import make_boxed_func
 import copy
-import sys, io
+import os
 import torch._dynamo as dynamo
-from .. import logger
+from aten_recompute import logger
+from aten_recompute.utils import save_fx_module_code_and_graph
 class GraphCapture:
     def __init__(self, model, *input):
         self.FW_gm = fx.GraphModule(torch.nn.Module(), fx.Graph())
@@ -58,28 +59,16 @@ class GraphCapture:
 
         fx_mod.graph.lint()
         fx_mod.recompile()
-        
-        # 2) 保存GraphModule的code
-        with io.StringIO() as buf:
-            original_stdout = sys.stdout
-            sys.stdout = buf
-            print(fx_mod.code)
-            sys.stdout = original_stdout
-            output = buf.getvalue()
-        with open('Fw_torch_Code.md', 'w') as f:
-            # 写入捕获的输出
-            f.write(output)
-                
-        # 3) 保存GraphModule的graph/Torch IR
-        with io.StringIO() as buf:
-            original_stdout = sys.stdout
-            sys.stdout = buf
-            print(fx_mod.graph)
-            sys.stdout = original_stdout
-            output = buf.getvalue()
-        with open('Fw_torch_IR.md', 'w') as f:
-            # 写入捕获的输出
-            f.write(output)
+
+        # 2) 保存 GraphModule 的 code 与 graph/Torch IR
+        # 使用环境变量 MODEL_NAME / PROJECT_ROOT 自动放入:
+        #   IR_artifacts/<model_name>/capture/
+        model_name = os.getenv("MODEL_NAME", "default_model")
+        save_fx_module_code_and_graph(
+            fx_mod,
+            model_name=model_name,
+            subfolder="capture",
+        )
 
         # 4) 把这个 GraphModule 编译一次
         compiled_model  = torch.compile(

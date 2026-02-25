@@ -3,7 +3,6 @@ import torch.fx as fx
 from typing import List, Dict, Set, Tuple, Optional
 from collections import deque
 import copy
-from ..Comm.hccl import *
 from torch.fx.node import Node
 from .. import logger  # 引入你配置好的 logger 工具
 

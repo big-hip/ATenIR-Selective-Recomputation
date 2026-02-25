@@ -1,7 +1,9 @@
 import logging
 import os
 
-LOGS_DIR = "dist_logs"
+# 统一将日志也放到 IR_artifacts 大目录下
+_PROJECT_ROOT = os.getenv("PROJECT_ROOT", os.getcwd())
+LOGS_DIR = os.path.join(_PROJECT_ROOT, "IR_artifacts", "logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 class CustomFormatter(logging.Formatter):
