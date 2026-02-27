@@ -6,15 +6,39 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+
+def cleanup_for_training(gm):
+    """
+    在训练前清理图中与分析阶段相关、但运行时不可执行的节点/kwargs：
+    1. 将所有 mark_layer 节点替换为其输入张量（mark_layer 是 identity op）。
+    2. 从所有节点的 kwargs 中删除 Dynamo 注入的 layer_Rank 残留键。
+    """
+    graph = gm.graph
+
+    # Pass 1：替换 mark_layer 节点
+    for node in list(graph.nodes):
+        if node.op == 'call_function' and 'mark_layer' in str(node.target):
+            # args[0] 是输入张量，mark_layer 是恒等映射
+            node.replace_all_uses_with(node.args[0])
+            graph.erase_node(node)
+
+    # Pass 2：清除所有节点上残留的 layer_Rank kwarg
+    for node in graph.nodes:
+        if 'layer_Rank' in node.kwargs:
+            node.kwargs = {k: v for k, v in node.kwargs.items() if k != 'layer_Rank'}
+
+    graph.lint()
+    gm.recompile()
+    return gm
+
 # 1. 设置重计算策略和日志级别
-# 策略1: 对所有候选的激活值进行重计算
-os.environ["RECOMPUTE"] = '{"1": null}'          
-os.environ["RECOMPUTE_LOG_LEVEL"] = "DEBUG"      
+os.environ["RECOMPUTE_LOG_LEVEL"] = "DEBUG"
 
 from Transformer import *
 from aten_recompute.core.Recom_pass import RecomputePass
 from aten_recompute.get_Aten_IR.Graph_compile_capture import GraphCapture
 from aten_recompute.utils import save_ir_and_dot
+from aten_recompute.core.Tag import inject_layer_tags
 
 # ==========================================
 # 初始化模型与数据 (保持你的原逻辑)
@@ -30,6 +54,9 @@ dropout = 0.1
 
 transformer = Transformer(src_vocab_size, tgt_vocab_size, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout)
 transformer.to(device)
+
+# 在捕获图之前注入层信息标签
+inject_layer_tags(transformer)
 
 src_data = torch.randint(1, src_vocab_size, (64, max_seq_length)).to(device)
 tgt_data = torch.randint(1, tgt_vocab_size, (64, max_seq_length)).to(device)
@@ -71,9 +98,9 @@ dist_ir_dict = {
 recompute_pass = RecomputePass(dist_ir_dict)
 recompute_pass.run() 
 
-# 提取优化后的图
-fw_gm_opt = recompute_pass.fw_gm
-bw_gm_opt = recompute_pass.bw_gm
+# 提取优化后的图，并清除训练时不可执行的 mark_layer / layer_Rank 残留
+fw_gm_opt = cleanup_for_training(recompute_pass.fw_gm)
+bw_gm_opt = cleanup_for_training(recompute_pass.bw_gm)
 
 print("重计算 Pass 运行完毕！")
 
@@ -101,3 +128,19 @@ save_ir_and_dot(
 )
 
 print("全部完成！请在 IR_artifacts 目录下查看该模型对应的重计算图。")
+
+# ==========================================
+# 阶段五：使用优化后的图进行真正的训练
+# ==========================================
+from aten_recompute.core.train_recomputed import run_training
+
+run_training(
+    fw_gm=fw_gm_opt,
+    bw_gm=bw_gm_opt,
+    model=transformer,
+    src_data=src_data,
+    tgt_data=tgt_data,
+    tgt_vocab_size=tgt_vocab_size,
+    criterion=criterion,
+    graph_capture=graph_capture,
+)

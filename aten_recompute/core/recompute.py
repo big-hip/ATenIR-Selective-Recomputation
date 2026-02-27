@@ -72,12 +72,18 @@ class ActivationRecomputation:
         # 1. Identify the nodes to be changed (the subgraph leading to the recomputation targets); these should point to the output.
         sorted_nodes_to_insert, activation_node_names = self._identify_nodes_to_change(true_activations_to_recompute_name)
 
+        # 1.5 For FW primals that are used by the recomputed subgraph but are NOT
+        # present in the BW graph as placeholders, add them:
+        #   - to activation_node_names so _modify_forward_graph passes them through FW output
+        #   - as new BW placeholders so lookup_fn_permissive can resolve them
+        self._ensure_primals_in_bw(sorted_nodes_to_insert, activation_node_names)
+
         # 3. Modify the backward graph.
         logger.debug(f"True activations to recompute: {true_activations_to_recompute_name}")
         logger.debug(f"Sorted nodes to insert: {sorted_nodes_to_insert}")
 
         self._modify_backward_graph(true_activations_to_recompute_name, sorted_nodes_to_insert)
-        
+
         # 2. Modify the forward graph.
         # Pass the now-modified activation node names, use built-in dead code elimination.
         self._modify_forward_graph(activation_node_names, true_activations_to_recompute_name)
@@ -91,6 +97,71 @@ class ActivationRecomputation:
 
         logger.info("Activation Recomputation Pass executed successfully.")
         return self.fw_gm, self.bw_gm
+
+    def _ensure_primals_in_bw(self, sorted_nodes_to_insert: List[Node], activation_node_names: set) -> None:
+        """
+        AOT Autograd may not save every FW primal (placeholder) to the BW graph
+        if it was not needed for gradient computation in the original graph.
+        When we recompute a subgraph in BW, that subgraph may reference such
+        primals directly.  If lookup_fn_permissive cannot resolve them, it returns
+        None, causing "got None for argument #0" at runtime.
+
+        This method pre-processes sorted_nodes_to_insert:
+          - Finds every FW placeholder input that is NOT yet a BW placeholder.
+          - Adds it as a new BW placeholder (inserted before the first tangent
+            placeholder so the calling-convention ordering stays consistent).
+          - Adds its name to activation_node_names so _modify_forward_graph
+            includes it in the FW output (making it available at runtime).
+        """
+        # Locate insertion point: just before the first tangent placeholder.
+        first_tangent = None
+        last_saved_ph = None
+        for n in self.bw_gm.graph.nodes:
+            if n.op == 'placeholder':
+                if n.name.startswith('tangents_'):
+                    if first_tangent is None:
+                        first_tangent = n
+                else:
+                    last_saved_ph = n
+
+        added: set = set()
+        for fw_node in sorted_nodes_to_insert:
+            for input_node in fw_node.all_input_nodes:
+                if (input_node.op == 'placeholder'
+                        and input_node.name not in self.bw_name_to_node
+                        and input_node.name not in added):
+                    added.add(input_node.name)
+                    # Keep this primal in the FW output.
+                    activation_node_names.add(input_node.name)
+                    logger.debug(
+                        f"[_ensure_primals_in_bw] FW primal '{input_node.name}' "
+                        f"is needed by recomputed nodes but absent from BW graph; "
+                        f"adding as new BW placeholder."
+                    )
+                    # Create the new BW placeholder.
+                    if first_tangent is not None:
+                        with self.bw_gm.graph.inserting_before(first_tangent):
+                            new_ph = self.bw_gm.graph.placeholder(input_node.name)
+                    elif last_saved_ph is not None:
+                        with self.bw_gm.graph.inserting_after(last_saved_ph):
+                            new_ph = self.bw_gm.graph.placeholder(input_node.name)
+                    else:
+                        raise RuntimeError(
+                            f"Cannot find a valid insertion point for new BW "
+                            f"placeholder '{input_node.name}'"
+                        )
+                    new_ph.meta = copy.copy(input_node.meta)
+                    self.bw_name_to_node[new_ph.name] = new_ph
+                    # Move the "last_saved_ph" pointer so subsequent insertions
+                    # remain in order.
+                    if first_tangent is None:
+                        last_saved_ph = new_ph
+
+        if added:
+            logger.info(
+                f"[_ensure_primals_in_bw] Added {len(added)} missing FW primals "
+                f"as BW placeholders: {sorted(added)}"
+            )
 
     def _get_true_recomputation_candidates(self, activations_to_recompute_name) -> Set[str]:
         """
@@ -130,22 +201,11 @@ class ActivationRecomputation:
         Identifies all nodes in the forward graph that need to be recomputed.
         """
         logger.debug("--- 1. Start identifying nodes to change ---")
-        
-        output_node = None
-        # Traverse the graph nodes from back to front to find the first 'output' node
-        for node in reversed(self.fw_gm.graph.nodes):
-            if node.op == 'output':
-                output_node = node
-                break
 
         nodes_to_change: Set[fx.Node] = set()
         activation_node_names = set()
-        
-        output_node = None # Re-find the output_node to ensure correctness
-        for node in reversed(self.fw_gm.graph.nodes):
-            if node.op == 'output':
-                output_node = node
-                break
+
+        output_node = next((n for n in reversed(self.fw_gm.graph.nodes) if n.op == 'output'), None)
         if output_node:
             for input_n in output_node.all_input_nodes:
                 activation_node_names.add(input_n.name)
@@ -171,14 +231,13 @@ class ActivationRecomputation:
 
         while queue:
             current_node = queue.popleft()
-            
+
             if current_node.name in activation_node_names:
                 continue
-            
-            nodes_to_change.add(current_node)
-            logger.debug(f"Processing node: {current_node}, inputs: {current_node.all_input_nodes}")
-            
+
             if current_node.op != 'placeholder':
+                nodes_to_change.add(current_node)
+                logger.debug(f"Processing node: {current_node}, inputs: {current_node.all_input_nodes}")
                 for input_node in current_node.all_input_nodes:
                     if input_node not in visited:
                         visited.add(input_node)

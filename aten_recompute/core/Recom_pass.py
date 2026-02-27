@@ -2,8 +2,8 @@ import os
 import json
 from typing import Any, Dict, List, Callable, Optional
 from .recompute import ActivationRecomputation
+from .get_activation_layer_ranks import get_activation_layer_ranks
 from .. import logger
-import copy
 
 class RecomputePass:
     """
@@ -29,7 +29,7 @@ class RecomputePass:
             dist_ir (Any): The distributed intermediate representation (IR) graph
                            on which recomputation will be applied.
         """
-        self.dist_ir =dist_ir
+        self.dist_ir = dist_ir
         self.fw_gm = self.dist_ir["FW"]
         self.bw_gm = self.dist_ir["BW"]
         
@@ -76,32 +76,10 @@ class RecomputePass:
 
     def _get_activation_layer_ranks(self) -> List[int]:
         """
-        Collect all unique layer_Rank values from activations.
-
-        An activation is defined as a forward node that is an input to the
-        output node, and also appears as a placeholder in the backward graph.
-
-        Returns:
-            List[int]: Sorted list of unique layer_Rank values.
+        调用外部的 get_activation_layer_ranks 工具函数，
+        基于当前的前向图和反向图获取激活所在的层级列表。
         """
-        output_node = next((n for n in reversed(self.fw_gm.graph.nodes) if n.op == 'output'), None)
-        if output_node is None:
-            logger.info("[RecomputePass] No output node found in forward graph.")
-            return []
-
-        # Collect all placeholder node names in the backward graph
-        bw_placeholder_names = {n.name for n in self.bw_gm.graph.nodes if n.op == 'placeholder'}
-
-        # Find matching nodes in output's inputs
-        layer_ranks = set()
-        for input_node in output_node.all_input_nodes:
-            if input_node.name in bw_placeholder_names:
-                layer_rank = input_node.kwargs.get("layer_Rank")
-                if layer_rank is not None:
-                    layer_ranks.add(layer_rank)
-
-        self.sorted_ranks = sorted(layer_ranks)
-        logger.info(f"[RecomputePass] Activation layer ranks: {self.sorted_ranks}")
+        self.sorted_ranks = get_activation_layer_ranks(self.fw_gm, self.bw_gm)
         return self.sorted_ranks
 
     
@@ -133,9 +111,8 @@ class RecomputePass:
         Execute the recomputation strategy selected via RECOMPUTE.
         """
         self._get_activation_layer_ranks()
-        if hasattr(self,'sorted_ranks'):
-            strategy = self.strategy_map.get(self.option, self._no_recompute)
-            strategy(self.option_param)
+        strategy = self.strategy_map.get(self.option, self._no_recompute)
+        strategy(self.option_param)
 
     def _recompute_all(self, _: None) -> None:
         """
@@ -146,7 +123,7 @@ class RecomputePass:
         target_ranks = set(self.sorted_ranks)
         node_names = self._get_node_names_by_layer_ranks(target_ranks)
         logger.info(f"[RecomputePass] Recomputing {len(node_names)} activation nodes: {node_names}")
-        ActivationRecomputation(self.fw_gm, self.bw_gm).run(node_names)
+        self.fw_gm, self.bw_gm = ActivationRecomputation(self.fw_gm, self.bw_gm).run(node_names)
 
     def _recompute_by_list(self, node_name_keywords: List[str]) -> None:
         """
@@ -161,7 +138,7 @@ class RecomputePass:
             if any(k in n.name for k in node_name_keywords)
         ]
         logger.info(f"[RecomputePass] Recomputing {len(node_names)} activation nodes: {node_names}")
-        ActivationRecomputation(self.fw_gm, self.bw_gm).run(node_names)
+        self.fw_gm, self.bw_gm = ActivationRecomputation(self.fw_gm, self.bw_gm).run(node_names)
 
     def _recompute_by_stride(self, stride_config: List[int]) -> None:
         """
@@ -182,9 +159,9 @@ class RecomputePass:
         }
         node_names = self._get_node_names_by_layer_ranks(target_ranks)
         logger.info(f"[RecomputePass] Recomputing {len(node_names)} activation nodes: {node_names}")
-        ActivationRecomputation(self.fw_gm, self.bw_gm).run(node_names)
+        self.fw_gm, self.bw_gm = ActivationRecomputation(self.fw_gm, self.bw_gm).run(node_names)
 
-       
+
     def _recompute_by_ratio(self, ratio: float) -> None:
         """
         Strategy 4: Recompute the first N% of layers based on a given ratio.
@@ -198,8 +175,7 @@ class RecomputePass:
         logger.info(f"[RecomputePass] Strategy 4: Recompute first {num_layers}/{len(self.sorted_ranks)} layers.")
         node_names = self._get_node_names_by_layer_ranks(target_ranks)
         logger.info(f"[RecomputePass] Recomputing {len(node_names)} activation nodes: {node_names}")
-        ActivationRecomputation(self.fw_gm, self.bw_gm).run(node_names)
-
+        self.fw_gm, self.bw_gm = ActivationRecomputation(self.fw_gm, self.bw_gm).run(node_names)
 
 
     def _recompute_by_op_type(self, op_types: List[str]) -> None:
@@ -210,22 +186,15 @@ class RecomputePass:
             op_types (List[str]): List of operator type strings (e.g., ["aten.relu", "aten.dropout"]).
         """
         logger.info(f"[RecomputePass] Strategy 5: Recompute nodes by op types: {op_types}")
-        # Collect all node names in the forward graph matching given op types and having layer_Rank
-        node_names = []
-        for n in self.fw_gm.graph.nodes:
-            if n.op == "call_function" and hasattr(n.target, "__module__"):
-                target_name = n.target.__name__
-                if target_name in op_types:
-                    node_names.append(n.name)
-        # node_names = [
-        #     n.name for n in self.fw_gm.graph.nodes
-        #     if n.op == "call_function" and
-        #        hasattr(n.target, "__module__") and
-        #        f"{n.target.__name__}" in op_types
-        # ]
-
+        node_names = [
+            n.name for n in self.fw_gm.graph.nodes
+            if n.op == "call_function"
+            and hasattr(n.target, "__name__")
+            and n.target.__name__ in op_types
+        ]
         logger.info(f"[RecomputePass] Recomputing {len(node_names)} activation nodes: {node_names}")
-        ActivationRecomputation(self.fw_gm, self.bw_gm).run(node_names)
+        self.fw_gm, self.bw_gm = ActivationRecomputation(self.fw_gm, self.bw_gm).run(node_names)
+
 
 
 
@@ -234,4 +203,3 @@ class RecomputePass:
         Default strategy: No recomputation is applied.
         """
         logger.info("[RecomputePass] Strategy 0: No recomputation applied.")
-        return 

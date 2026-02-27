@@ -15,14 +15,34 @@ class GraphCapture:
         self.inputs = inputs
     
     def inspect_backend(self, gm, sample_inputs):
+        # sample_inputs 是 Dynamo 传入 backend 的真实张量，包含模型参数，
+        # 且顺序 = 前向传播访问顺序（Dynamo 按遇到顺序提升 get_attr 为输入）。
+        # 用 data_ptr() 把其中属于模型参数/buffer 的张量过滤出来，
+        # 即可得到 FW 图 primal 的正确参数顺序。
+        all_params: dict = {}
+        for _, p in self.model.named_parameters(remove_duplicate=False):
+            all_params[p.data_ptr()] = p
+        for _, b in self.model.named_buffers():
+            all_params[b.data_ptr()] = b
+
+        seen: set = set()
+        fw_params: list = []
+        for t in sample_inputs:
+            if isinstance(t, torch.Tensor):
+                ptr = t.data_ptr()
+                if ptr in all_params and ptr not in seen:
+                    seen.add(ptr)
+                    fw_params.append(all_params[ptr])
+        self.fw_params_flat = fw_params
+
         def fw(gm, _sample_inputs):
             self.FW_gm = copy.deepcopy(gm)
             return make_boxed_func(gm.forward)
-        
+
         def bw(gm, _sample_inputs):
             self.BW_gm = copy.deepcopy(gm)
             return make_boxed_func(gm.forward)
-            
+
         return aot_module_simplified(gm, sample_inputs, fw_compiler=fw, bw_compiler=bw)
 
     def compile(self):
