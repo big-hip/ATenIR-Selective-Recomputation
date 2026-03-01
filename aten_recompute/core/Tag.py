@@ -1,5 +1,8 @@
 import torch
 from torch.library import custom_op
+from torch.utils.hooks import RemovableHandle
+from typing import Iterable, List, Tuple
+import torch.nn as nn
 
 # 1. 注册一个自定义的 ATen 算子：接受 Tensor 和层号，返回 Tensor
 @custom_op("my_compiler::mark_layer", mutates_args=())
@@ -33,31 +36,38 @@ torch.library.register_autograd(
 )
 
 # 2. 编写 Hook 注入函数
-def inject_layer_tags(model):
+def inject_layer_tags(
+    layers: Iterable[Tuple[nn.Module, int]],
+) -> List[RemovableHandle]:
     """
-    遍历模型的 encoder_layers 和 decoder_layers，自动打上 layer_rank 的标记。
-    encoder 层编号从 0 开始，decoder 层编号紧接在 encoder 之后。
+    为指定的层列表注入 layer_rank 前向钩子。
+
+    Args:
+        layers: 可迭代对象，每项为 (nn.Module, rank: int)。
+                调用方自行构造层与 rank 的对应关系，与模型架构无关。
+
+    Returns:
+        List[RemovableHandle]：每个注册的钩子对应一个 handle。
+        在测试或推理时调用 handle.remove() 可撤销所有钩子。
+
+    Example（Encoder-Decoder Transformer）::
+
+        enc = [(layer, i) for i, layer in enumerate(model.encoder_layers)]
+        dec = [(layer, len(model.encoder_layers) + i)
+               for i, layer in enumerate(model.decoder_layers)]
+        handles = inject_layer_tags(enc + dec)
+
+    Example（GPT-2 风格，只有 decoder）::
+
+        handles = inject_layer_tags([(blk, i) for i, blk in enumerate(model.transformer.h)])
     """
-    for i, layer in enumerate(model.encoder_layers):
-        def pre_hook(module, args, rank=i):
+    handles: List[RemovableHandle] = []
+    for layer, rank in layers:
+        def pre_hook(module, args, r=rank):
             x = args[0]
             if isinstance(x, torch.Tensor):
-                tagged_x = torch.ops.my_compiler.mark_layer(x, rank)
+                tagged_x = torch.ops.my_compiler.mark_layer(x, r)
                 return (tagged_x,) + args[1:]
             return args
-        layer.register_forward_pre_hook(pre_hook)
-
-    n_encoder = len(model.encoder_layers)
-    for i, layer in enumerate(model.decoder_layers):
-        def pre_hook(module, args, rank=n_encoder + i):
-            x = args[0]
-            if isinstance(x, torch.Tensor):
-                tagged_x = torch.ops.my_compiler.mark_layer(x, rank)
-                return (tagged_x,) + args[1:]
-            return args
-        layer.register_forward_pre_hook(pre_hook)
-
-# 3. 在你的 main.py 中调用它 (在 graph_capture 之前)
-# transformer = Transformer(...)
-# inject_layer_tags(transformer)  <--- 加入这一行
-# graph_capture = GraphCapture(transformer, src_data, tgt_data[:, :-1])
+        handles.append(layer.register_forward_pre_hook(pre_hook))
+    return handles

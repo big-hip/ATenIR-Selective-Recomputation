@@ -4,6 +4,10 @@ from typing import Optional, Tuple
 import torch.fx as fx
 from torch.fx.passes.graph_drawer import FxGraphDrawer
 
+from .logger import get_logger
+
+_logger = get_logger(__name__)
+
 __all__ = [
     "save_fx_module_code_and_graph",
     "save_graphmodule_readable",
@@ -108,7 +112,9 @@ def save_ir_and_dot(
         with open(dot_path, "w", encoding="utf-8") as f:
             f.write(dot_str)
     except Exception as e:
-        print(f"[警告] 生成 DOT 文件失败，可能是节点存在不兼容类型: {e}")
+        _logger.warning(
+            "[save_ir_and_dot] 生成 DOT 文件失败，可能是节点存在不兼容类型: %s", e, exc_info=True
+        )
 
     # 3. 保存底层生成的 Python Forward 代码
     with open(code_path, "w", encoding="utf-8") as f:

@@ -4,7 +4,10 @@ from typing import List, Dict, Set, Tuple, Optional
 from collections import deque
 import copy
 from torch.fx.node import Node
-from .. import logger  # 引入你配置好的 logger 工具
+from ..utils.logger import get_logger
+from ..utils.graph_utils import get_output_node
+
+logger = get_logger(__name__)
 
 class ActivationRecomputation:
     """
@@ -67,30 +70,25 @@ class ActivationRecomputation:
         Returns:
             Tuple[fx.GraphModule, fx.GraphModule]: The optimized (forward graph module, backward graph module).
         """
-        # 0
+        # 0. 筛选出真正可重计算的激活（FW output ∩ BW placeholder ∩ 用户请求）
         true_activations_to_recompute_name = self._get_true_recomputation_candidates(activations_to_recompute_name)
-        # 1. Identify the nodes to be changed (the subgraph leading to the recomputation targets); these should point to the output.
+        # 1. 确定重计算子图（BFS 向上追溯依赖链）及更新后的 FW 输出节点名集合
         sorted_nodes_to_insert, activation_node_names = self._identify_nodes_to_change(true_activations_to_recompute_name)
 
-        # 1.5 For FW primals that are used by the recomputed subgraph but are NOT
-        # present in the BW graph as placeholders, add them:
-        #   - to activation_node_names so _modify_forward_graph passes them through FW output
-        #   - as new BW placeholders so lookup_fn_permissive can resolve them
+        # 1.5 补全子图中需要、但 BW 图中尚不存在的 FW primal placeholder
         self._ensure_primals_in_bw(sorted_nodes_to_insert, activation_node_names)
 
-        # 3. Modify the backward graph.
-        logger.debug(f"True activations to recompute: {true_activations_to_recompute_name}")
-        logger.debug(f"Sorted nodes to insert: {sorted_nodes_to_insert}")
-
+        # 2. 修改反向图：将重计算子图插入 BW，替换原有 saved placeholder
+        logger.debug("True activations to recompute: %s", true_activations_to_recompute_name)
+        logger.debug("Sorted nodes to insert: %s", sorted_nodes_to_insert)
         self._modify_backward_graph(true_activations_to_recompute_name, sorted_nodes_to_insert)
 
-        # 2. Modify the forward graph.
-        # Pass the now-modified activation node names, use built-in dead code elimination.
+        # 3. 修改前向图：更新输出节点，执行死代码消除
         self._modify_forward_graph(activation_node_names, true_activations_to_recompute_name)
         self.fw_gm = self.rebuild_graph(self.fw_gm)
         self.bw_gm = self.rebuild_graph(self.bw_gm)
-        
-        # 4. Clean up the graphs and recompile.
+
+        # 4. 重新编译两张图
         for gm in [self.fw_gm, self.bw_gm]:
             gm.recompile()
             gm.graph.lint()
@@ -196,7 +194,7 @@ class ActivationRecomputation:
 
         return true_candidates
 
-    def _identify_nodes_to_change(self, activations_to_recompute: List[str]) -> Tuple[Set[fx.Node], Set[str]]:
+    def _identify_nodes_to_change(self, activations_to_recompute: Set[str]) -> Tuple[List[fx.Node], Set[str]]:
         """
         Identifies all nodes in the forward graph that need to be recomputed.
         """
@@ -205,7 +203,7 @@ class ActivationRecomputation:
         nodes_to_change: Set[fx.Node] = set()
         activation_node_names = set()
 
-        output_node = next((n for n in reversed(self.fw_gm.graph.nodes) if n.op == 'output'), None)
+        output_node = get_output_node(self.fw_gm)
         if output_node:
             for input_n in output_node.all_input_nodes:
                 activation_node_names.add(input_n.name)
@@ -244,6 +242,22 @@ class ActivationRecomputation:
                         queue.append(input_node)
                         
         logger.debug(f"Identification complete, found {len(nodes_to_change)} nodes to be changed: {[n.name for n in sorted(list(nodes_to_change), key=lambda x: x.name)]}")
+
+        # 子图规模检查：若重计算节点超过 FW 图计算节点总数的 50% 则发出警告
+        total_fw_compute = sum(
+            1 for n in self.fw_gm.graph.nodes if n.op not in ('placeholder', 'output')
+        )
+        if total_fw_compute > 0:
+            recompute_ratio = len(nodes_to_change) / total_fw_compute
+            logger.info(
+                f"[Recompute] 子图规模: {len(nodes_to_change)}/{total_fw_compute} "
+                f"({recompute_ratio:.0%}) FW 计算节点将被重计算。"
+            )
+            if recompute_ratio > 0.5:
+                logger.warning(
+                    f"[Recompute] 重计算子图覆盖了 {recompute_ratio:.0%} 的 FW 计算节点，"
+                    f"可能导致重计算开销过高。建议检查是否存在未保存的中间激活导致 BFS 越界向上追溯。"
+                )
         
         activation_node_names.update(
             node.name for node in nodes_to_change if node.op == 'placeholder'
@@ -255,8 +269,10 @@ class ActivationRecomputation:
             sorted_nodes_to_insert = self._topological_sort(nodes_to_change)
             logger.debug(f"Global topological sort complete, {len(sorted_nodes_to_insert)} nodes in total.")
         except RuntimeError as e:
-            logger.error(f"Topological sort error: {e}")
-            return set(), set()
+            logger.error("Topological sort error: %s", e)
+            raise RuntimeError(
+                f"重计算子图拓扑排序失败，可能存在环路。请检查 activations_to_recompute 的合法性。"
+            ) from e
             
         return sorted_nodes_to_insert, activation_node_names
 
@@ -266,7 +282,7 @@ class ActivationRecomputation:
         """
         logger.debug("--- 2. Start resetting the forward graph's output based on the given list ---")
             
-        fw_output_node = next((n for n in reversed(self.fw_gm.graph.nodes) if n.op == 'output'), None)
+        fw_output_node = get_output_node(self.fw_gm)
         if not fw_output_node:
             logger.warning("Forward graph has no output node, skipping modification.")
             return
@@ -328,8 +344,20 @@ class ActivationRecomputation:
         if not placeholders_to_replace:
             return
 
-        global_node_map: Dict[fx.Node, fx.Node] = {} 
-        
+        global_node_map: Dict[fx.Node, fx.Node] = {}
+
+        # lookup_fn_permissive 引用 global_node_map（循环中会被填充），
+        # 定义在循环外以避免每次迭代都创建新函数对象。
+        def lookup_fn_permissive(n: fx.Node) -> Optional[fx.Node]:
+            if n in global_node_map:
+                return global_node_map[n]
+            return self.bw_name_to_node.get(n.name)
+
+        # 预构建 BW 节点位置索引，避免 O(N²) 线性扫描
+        bw_node_position: Dict[fx.Node, int] = {
+            node: i for i, node in enumerate(self.bw_gm.graph.nodes)
+        }
+
         for node_to_create in sorted_nodes_to_insert:
             logger.debug(f"[Loop] Processing original forward node: {node_to_create.op} '{node_to_create.name}'")
 
@@ -340,37 +368,34 @@ class ActivationRecomputation:
                     raise RuntimeError(
                         f"Naming conflict! Node '{new_name}' already exists in the backward graph and is not a placeholder to be replaced."
                     )
-            
-            def lookup_fn_permissive(n: fx.Node) -> Optional[fx.Node]:
-                if n in global_node_map:
-                    return global_node_map[n]
-                return self.bw_name_to_node.get(n.name)
-            
+
             new_args = fx.node.map_arg(node_to_create.args, lambda n: lookup_fn_permissive(n) if isinstance(n, fx.Node) else n)
             new_kwargs = fx.node.map_arg(node_to_create.kwargs, lambda n: lookup_fn_permissive(n) if isinstance(n, fx.Node) else n)
-            
-            insertion_point = None
-            all_input_nodes = []
-            def get_input_nodes(a):
+
+            # 用位置索引 O(1) 找到最晚的依赖节点，避免 O(N²) 全图扫描
+            all_input_nodes: List[fx.Node] = []
+            def _collect(a):
                 if isinstance(a, fx.Node):
                     all_input_nodes.append(a)
-            fx.node.map_arg(new_args, get_input_nodes)
-            fx.node.map_arg(new_kwargs, get_input_nodes)
-            
-            latest_dependency_node = None
-            for node in self.bw_gm.graph.nodes:
-                if node in all_input_nodes:
-                    latest_dependency_node = node
+            fx.node.map_arg(new_args, _collect)
+            fx.node.map_arg(new_kwargs, _collect)
+
+            latest_dependency_node = max(
+                (n for n in all_input_nodes if n in bw_node_position),
+                key=lambda n: bw_node_position[n],
+                default=None,
+            )
             
             if latest_dependency_node:
                 insertion_point = latest_dependency_node
             else:
-                last_placeholder = None
-                for node in self.bw_gm.graph.nodes:
-                    if node.op == 'placeholder':
-                        last_placeholder = node
-                insertion_point = last_placeholder
-            
+                # 无输入依赖：插在最后一个 placeholder 之后
+                insertion_point = max(
+                    (n for n in bw_node_position if n.op == 'placeholder'),
+                    key=lambda n: bw_node_position[n],
+                    default=None,
+                )
+
             if insertion_point is None:
                 raise RuntimeError("Could not find any valid insertion point for the node!")
 
@@ -384,10 +409,12 @@ class ActivationRecomputation:
                     kwargs=new_kwargs
                 )
                 new_node.meta = meta_copy
-                logger.debug(f"> Successfully created and inserted new node: '{new_node.name}'")
+                logger.debug("> Successfully created and inserted new node: '%s'", new_node.name)
 
                 global_node_map[node_to_create] = new_node
                 self.bw_name_to_node[new_node.name] = new_node
+                # 插入新节点后更新位置索引，保证后续迭代的 max() 仍然正确
+                bw_node_position[new_node] = max(bw_node_position.values()) + 1
 
         replaced_count = 0
         for act_name, old_placeholder_node in placeholders_to_replace.items():
@@ -399,7 +426,10 @@ class ActivationRecomputation:
                 self.bw_gm.graph.erase_node(old_placeholder_node)
                 replaced_count += 1
             else:
-                logger.error(f"[Critical Error] Failed to find the final replacement node for '{act_name}'.")
+                raise RuntimeError(
+                    f"[_modify_backward_graph] 无法找到激活 '{act_name}' 对应的重计算节点。"
+                    f"请检查 sorted_nodes_to_insert 是否包含该激活的完整依赖链。"
+                )
         
         logger.debug(f"Successfully replaced {replaced_count} / {len(placeholders_to_replace)} old placeholders.")
         self.re_init_maps()

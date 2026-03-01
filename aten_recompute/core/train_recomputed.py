@@ -4,9 +4,19 @@ train_recomputed.py
 
 核心难点：AOT Autograd 在 dynamic=True 时会从模型输入张量的动态维度中提取 SymInt
 作为独立的整数 primal，且排在参数之前，因此需要在运行时自动推断调用约定。
+
+公开接口
+--------
+make_recomputed_fn(fw_gm, bw_gm, params_flat)
+    将 FW/BW 图包装为可调用对象，返回 call(*model_tensor_inputs) 函数。
+
+run_training(fw_gm, bw_gm, model, step_fn, ...)
+    通用训练循环，接受一个无参的 step_fn() 可调用对象执行每步训练。
+    也提供带领域参数的 Transformer 便捷包装（向后兼容）。
 """
 
 import torch
+from typing import Callable, Optional
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -174,11 +184,13 @@ def make_recomputed_fn(fw_gm, bw_gm, params_flat):
 
             fw_raw = fw_gm(*primals)
 
-            assert len(model_out_fw_indices) == 1, (
-                f"预期恰好 1 个模型输出，实际发现 {len(model_out_fw_indices)} 个: "
-                f"{model_out_fw_indices}"
-            )
-            model_out = fw_raw[model_out_fw_indices[0]]
+            # 提取模型输出：
+            #   单输出 → 直接返回张量（向后兼容）
+            #   多输出 → 返回元组，调用方按需解包
+            if len(model_out_fw_indices) == 1:
+                model_out = fw_raw[model_out_fw_indices[0]]
+            else:
+                model_out = tuple(fw_raw[i] for i in model_out_fw_indices)
 
             # 张量型 saved 存入 ctx.save_for_backward；标量型（SymInt 等）单独记录
             saved_tensors = [
@@ -267,65 +279,86 @@ def run_training(
     fw_gm,
     bw_gm,
     model,
-    src_data,
-    tgt_data,
-    tgt_vocab_size: int,
-    criterion,
+    step_fn: Optional[Callable[[], None]] = None,
+    # ── 以下为向后兼容的 Transformer 特定参数（step_fn 优先）──────────────
+    src_data=None,
+    tgt_data=None,
+    tgt_vocab_size: int = None,
+    criterion=None,
     graph_capture=None,
+    # ──────────────────────────────────────────────────────────────────────
     lr: float = 0.0001,
     n_steps: int = 10,
 ):
     """
     使用重计算优化后的 FW/BW 图进行训练验证。
 
-    Args:
-        fw_gm          : 重计算优化后的前向 GraphModule
-        bw_gm          : 重计算优化后的反向 GraphModule
-        model          : 原始 nn.Module（用于获取 params/buffers 和构造优化器）
-        src_data       : 源序列张量
-        tgt_data       : 目标序列张量（含 <EOS>，内部自动做 [:, :-1] / [:, 1:] 切分）
-        tgt_vocab_size : 目标词表大小，用于 loss reshape
-        criterion      : 损失函数
-        graph_capture  : 保留参数，暂未使用（预留扩展接口）
-        lr             : Adam 学习率，默认 1e-4
-        n_steps        : 训练步数，默认 10
+    推荐用法（通用，解耦领域逻辑）::
+
+        recomputed_forward = make_recomputed_fn(fw_gm, bw_gm, params_flat)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+        def my_step():
+            optimizer.zero_grad()
+            loss = my_loss_fn(recomputed_forward(*my_inputs))
+            loss.backward()
+            optimizer.step()
+
+        run_training(fw_gm, bw_gm, model, step_fn=my_step, n_steps=10)
+
+    向后兼容用法（Transformer 特定）::
+
+        run_training(fw_gm, bw_gm, model,
+                     src_data=src_data, tgt_data=tgt_data,
+                     tgt_vocab_size=tgt_vocab_size, criterion=criterion,
+                     graph_capture=graph_capture, n_steps=10)
+
+    Parameters
+    ----------
+    fw_gm / bw_gm : 重计算优化后的 GraphModule
+    model         : 原始 nn.Module（用于获取 params 和构造优化器）
+    step_fn       : 若提供，每步直接调用 step_fn()（无参数），忽略下方所有领域参数。
+    src_data / tgt_data / tgt_vocab_size / criterion / graph_capture :
+                  Transformer 特定的向后兼容参数，step_fn=None 时使用。
+    lr            : Adam 学习率（仅在向后兼容路径下使用）
+    n_steps       : 训练步数
     """
-    print("\n[训练准备] 将优化后的图接入 PyTorch 自动微分系统...")
+    print(f"\n[训练开始] 使用重计算优化图进行训练（{n_steps} 步）...")
 
-    n_primals      = sum(1 for n in fw_gm.graph.nodes if n.op == 'placeholder')
-    fw_ph_names    = [n.name for n in fw_gm.graph.nodes if n.op == 'placeholder']
-    print(f"  FW 图 placeholder 数量: {n_primals}，名字: {fw_ph_names}")
-
-    # 按 FW 图 primal 顺序构建 params_flat。
-    # 优先用 graph_capture.fw_params_flat（由 inspect_backend 从真实 sample_inputs
-    # 中按前向访问顺序提取的参数列表）；若不可用则退回模块树遍历顺序（可能不准确）。
-    if graph_capture is not None and getattr(graph_capture, 'fw_params_flat', None):
-        params_flat   = graph_capture.fw_params_flat
-        print(f"  使用 sample_inputs data_ptr 匹配重建 params_flat（{len(params_flat)} 个），顺序与 FW 图一致。")
+    if step_fn is not None:
+        # ── 通用路径：由调用方提供完整的训练步骤 ─────────────────────────────
+        for step in range(n_steps):
+            step_fn()
+            if (step + 1) % max(1, n_steps // 5) == 0 or step == 0:
+                print(f"  Step {step + 1:2d}/{n_steps}")
     else:
-        params_flat   = _collect_params_in_fw_order(model)
-        print(f"  警告：未提供 graph_capture.fw_params_flat，退回到模块树遍历顺序（{len(params_flat)} 个）。")
-
-    n_params_flat  = len(params_flat)
-    n_model_inputs = n_primals - n_params_flat
-    print(f"  params+buffers: {n_params_flat} 个，非 param primals: {n_model_inputs} 个（含 SymInt）")
-
-    recomputed_forward = make_recomputed_fn(fw_gm, bw_gm, params_flat)
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9
-    )
-
-    print(f"\n[训练开始] 使用重计算优化图进行训练（{n_steps} 步验证）...")
-    for step in range(n_steps):
-        optimizer.zero_grad()
-
-        output = recomputed_forward(src_data, tgt_data[:, :-1])
-        loss = criterion(
-            output.contiguous().view(-1, tgt_vocab_size),
-            tgt_data[:, 1:].contiguous().view(-1),
+        # ── 向后兼容路径：Transformer seq2seq 特定逻辑 ──────────────────────
+        assert src_data is not None and tgt_data is not None, (
+            "step_fn=None 时必须提供 src_data / tgt_data。"
         )
-        loss.backward()
-        optimizer.step()
-        print(f"  Step {step + 1:2d} | Loss: {loss.item():.4f}")
+        n_primals   = sum(1 for n in fw_gm.graph.nodes if n.op == 'placeholder')
+        fw_ph_names = [n.name for n in fw_gm.graph.nodes if n.op == 'placeholder']
+        print(f"  FW 图 placeholder 数量: {n_primals}，名字: {fw_ph_names}")
+
+        if graph_capture is not None and getattr(graph_capture, 'fw_params_flat', None):
+            params_flat = graph_capture.fw_params_flat
+            print(f"  使用 sample_inputs data_ptr 匹配重建 params_flat（{len(params_flat)} 个）。")
+        else:
+            params_flat = _collect_params_in_fw_order(model)
+            print(f"  警告：退回到模块树遍历顺序（{len(params_flat)} 个）。")
+
+        recomputed_forward = make_recomputed_fn(fw_gm, bw_gm, params_flat)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9)
+
+        for step in range(n_steps):
+            optimizer.zero_grad()
+            output = recomputed_forward(src_data, tgt_data[:, :-1])
+            loss = criterion(
+                output.contiguous().view(-1, tgt_vocab_size),
+                tgt_data[:, 1:].contiguous().view(-1),
+            )
+            loss.backward()
+            optimizer.step()
+            print(f"  Step {step + 1:2d} | Loss: {loss.item():.4f}")
 
     print("训练完成。")

@@ -1,16 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.utils.data as data
 import math
 import copy
 
-import torch._dynamo
-from torch.fx.passes.graph_drawer import FxGraphDrawer
-from functorch.compile import make_boxed_func
-from torch._functorch.aot_autograd import aot_module_simplified
-device = torch.device("cuda") if torch.cuda.is_available() else "cpu" 
-# print(f"正在使用的设备是: {device}")
+device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
 
 
 class MultiHeadAttention(nn.Module):

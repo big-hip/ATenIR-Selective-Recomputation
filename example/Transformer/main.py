@@ -7,140 +7,174 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 
-def cleanup_for_training(gm):
-    """
-    在训练前清理图中与分析阶段相关、但运行时不可执行的节点/kwargs：
-    1. 将所有 mark_layer 节点替换为其输入张量（mark_layer 是 identity op）。
-    2. 从所有节点的 kwargs 中删除 Dynamo 注入的 layer_Rank 残留键。
-    """
-    graph = gm.graph
+def main():
+    # ──────────────────────────────────────────────────────────────────────────
+    # 0. 全局配置
+    # ──────────────────────────────────────────────────────────────────────────
+    os.environ["RECOMPUTE_LOG_LEVEL"] = "DEBUG"
 
-    # Pass 1：替换 mark_layer 节点
-    for node in list(graph.nodes):
-        if node.op == 'call_function' and 'mark_layer' in str(node.target):
-            # args[0] 是输入张量，mark_layer 是恒等映射
-            node.replace_all_uses_with(node.args[0])
-            graph.erase_node(node)
+    import copy
+    import torch
+    import torch.nn as nn
 
-    # Pass 2：清除所有节点上残留的 layer_Rank kwarg
-    for node in graph.nodes:
-        if 'layer_Rank' in node.kwargs:
-            node.kwargs = {k: v for k, v in node.kwargs.items() if k != 'layer_Rank'}
+    from Transformer import Transformer, device
+    from aten_recompute.core.Recom_pass import RecomputePass
+    from aten_recompute.get_Aten_IR.Graph_compile_capture import GraphCapture
+    from aten_recompute.utils import save_ir_and_dot, MemoryAnalyzer
+    from aten_recompute.core.Tag import inject_layer_tags
+    from aten_recompute.core.train_recomputed import (
+        run_training, make_recomputed_fn, _collect_params_in_fw_order,
+    )
 
-    graph.lint()
-    gm.recompile()
-    return gm
+    model_name = os.getenv("MODEL_NAME", "Transformer")
 
-# 1. 设置重计算策略和日志级别
-os.environ["RECOMPUTE_LOG_LEVEL"] = "DEBUG"
+    # ──────────────────────────────────────────────────────────────────────────
+    # 1. 初始化模型与数据
+    # ──────────────────────────────────────────────────────────────────────────
+    src_vocab_size = 5000
+    tgt_vocab_size = 5000
+    d_model        = 512
+    num_heads      = 8
+    num_layers     = 6
+    d_ff           = 2048
+    max_seq_length = 100
+    dropout        = 0.1
 
-from Transformer import *
-from aten_recompute.core.Recom_pass import RecomputePass
-from aten_recompute.get_Aten_IR.Graph_compile_capture import GraphCapture
-from aten_recompute.utils import save_ir_and_dot
-from aten_recompute.core.Tag import inject_layer_tags
+    transformer = Transformer(
+        src_vocab_size, tgt_vocab_size, d_model, num_heads,
+        num_layers, d_ff, max_seq_length, dropout,
+    )
+    transformer.to(device)
 
-# ==========================================
-# 初始化模型与数据 (保持你的原逻辑)
-# ==========================================
-src_vocab_size = 5000
-tgt_vocab_size = 5000
-d_model = 512
-num_heads = 8
-num_layers = 1
-d_ff = 2048 
-max_seq_length = 100
-dropout = 0.1
+    # 在捕获图之前注入层信息标签
+    _enc_layers = [(layer, i) for i, layer in enumerate(transformer.encoder_layers)]
+    _dec_layers = [
+        (layer, len(transformer.encoder_layers) + i)
+        for i, layer in enumerate(transformer.decoder_layers)
+    ]
+    _tag_handles = inject_layer_tags(_enc_layers + _dec_layers)  # 保存 handles 以备移除
 
-transformer = Transformer(src_vocab_size, tgt_vocab_size, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout)
-transformer.to(device)
+    src_data = torch.randint(1, src_vocab_size, (64, max_seq_length)).to(device)
+    tgt_data = torch.randint(1, tgt_vocab_size, (64, max_seq_length)).to(device)
 
-# 在捕获图之前注入层信息标签
-inject_layer_tags(transformer)
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    transformer.train()
 
-src_data = torch.randint(1, src_vocab_size, (64, max_seq_length)).to(device)
-tgt_data = torch.randint(1, tgt_vocab_size, (64, max_seq_length)).to(device)
+    # ──────────────────────────────────────────────────────────────────────────
+    # 2. 捕获 FW/BW 图
+    # ──────────────────────────────────────────────────────────────────────────
+    print("\n[1/4] 捕获 AOT Autograd FW/BW 图...")
+    graph_capture = GraphCapture(transformer, src_data, tgt_data[:, :-1])
+    compiled_transformer = graph_capture.compile()
 
-criterion = nn.CrossEntropyLoss(ignore_index=0)
-transformer.train()
+    output = compiled_transformer(src_data, tgt_data[:, :-1])
+    loss = criterion(
+        output.contiguous().view(-1, tgt_vocab_size),
+        tgt_data[:, 1:].contiguous().view(-1),
+    )
+    loss.backward()
+    print("图捕获完成！fw_gm 和 bw_gm 已就绪。")
 
-# ==========================================
-# 阶段一：注册捕获回调 (Compile)
-# 使用 aten_recompute/get_Aten_IR/Graph_compile_capture.py 中的 GraphCapture
-# ==========================================
-graph_capture = GraphCapture(transformer, src_data, tgt_data[:, :-1])
-compiled_transformer = graph_capture.compile()
+    # ──────────────────────────────────────────────────────────────────────────
+    # 3. 执行重计算 Pass
+    # ──────────────────────────────────────────────────────────────────────────
+    print("\n[2/4] 执行重计算 Pass 优化计算图...")
 
-# ==========================================
-# 阶段二：预热执行 (Warm-up) -> 触发真正的图捕获
-# ==========================================
-print("\n[1/3] 执行预热 (Warm-up)，触发 AOT Autograd 捕获前向与反向图...")
+    # 在 Pass 运行前拍快照：
+    # _modify_forward_graph 原地修改 fw_gm，估算"之前"状态必须用快照。
+    _fw_before = copy.deepcopy(graph_capture.fw_gm)
+    _bw_before = copy.deepcopy(graph_capture.bw_gm)
 
-# 前向传播 (触发 fw_compiler，捕获 FW_gm)
-output = compiled_transformer(src_data, tgt_data[:, :-1])
-loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+    recompute_pass = RecomputePass({"FW": graph_capture.fw_gm, "BW": graph_capture.bw_gm})
+    fw_gm_opt, bw_gm_opt = recompute_pass.run()   # run() 现在返回 (fw_gm, bw_gm)
 
-# 反向传播 (触发 bw_compiler，捕获 BW_gm)
-loss.backward()
+    # ──────────────────────────────────────────────────────────────────────────
+    # 3.5 静态激活内存估算（cleanup 之前，meta['val'] 仍完整）
+    # ──────────────────────────────────────────────────────────────────────────
+    _device = "cuda" if torch.cuda.is_available() else "cpu"
+    analyzer = MemoryAnalyzer(device=_device)
+    analyzer.estimate_parameter_memory(transformer)
+    analyzer.estimate(
+        fw_before=_fw_before, bw_before=_bw_before,
+        fw_after=fw_gm_opt,   bw_after=bw_gm_opt,
+    )
+    analyzer.save_report(model_name=model_name)   # 静态结果立即落盘
 
-print("图捕获完成！FW_gm 和 BW_gm 已就绪。")
+    # 清理图中分析阶段残留（mark_layer / layer_Rank）
+    fw_gm_opt = GraphCapture.cleanup_graph(fw_gm_opt)
+    bw_gm_opt = GraphCapture.cleanup_graph(bw_gm_opt)
+    print("重计算 Pass 运行完毕！")
 
-# ==========================================
-# 阶段三：执行重计算 Pass (图变换)
-# ==========================================
-print("\n[2/3] 执行重计算 Pass 优化计算图...")
-dist_ir_dict = {
-    "FW": graph_capture.FW_gm, 
-    "BW": graph_capture.BW_gm
-}
+    # ──────────────────────────────────────────────────────────────────────────
+    # 4. 保存优化后的图
+    # ──────────────────────────────────────────────────────────────────────────
+    print("\n[3/4] 保存优化后的图到文件...")
+    save_ir_and_dot(fw_gm_opt, model_name=model_name, subfolder="recompute", graph_name="FW_recomputed")
+    save_ir_and_dot(bw_gm_opt, model_name=model_name, subfolder="recompute", graph_name="BW_recomputed")
+    print("全部完成！请在 IR_artifacts 目录下查看该模型对应的重计算图。")
 
-# 实例化并运行重计算 Pass
-recompute_pass = RecomputePass(dist_ir_dict)
-recompute_pass.run() 
+    # ──────────────────────────────────────────────────────────────────────────
+    # 5. 使用优化后的图进行训练验证
+    # ──────────────────────────────────────────────────────────────────────────
+    if getattr(graph_capture, 'fw_params_flat', None):
+        _params_flat = graph_capture.fw_params_flat
+    else:
+        _params_flat = _collect_params_in_fw_order(transformer)
 
-# 提取优化后的图，并清除训练时不可执行的 mark_layer / layer_Rank 残留
-fw_gm_opt = cleanup_for_training(recompute_pass.fw_gm)
-bw_gm_opt = cleanup_for_training(recompute_pass.bw_gm)
+    _recomputed_forward = make_recomputed_fn(fw_gm_opt, bw_gm_opt, _params_flat)
+    _optimizer = torch.optim.Adam(transformer.parameters(), lr=1e-4, betas=(0.9, 0.98), eps=1e-9)
 
-print("重计算 Pass 运行完毕！")
+    def _recomputed_step():
+        _optimizer.zero_grad()
+        out = _recomputed_forward(src_data, tgt_data[:, :-1])
+        _loss = criterion(
+            out.contiguous().view(-1, tgt_vocab_size),
+            tgt_data[:, 1:].contiguous().view(-1),
+        )
+        _loss.backward()
+        _optimizer.step()
+        return _loss
 
-# ==========================================
-# 阶段四：保存优化后的图进行验证
-# ==========================================
-print("\n[3/3] 保存优化后的图到文件...")
+    run_training(fw_gm_opt, bw_gm_opt, transformer, step_fn=_recomputed_step, n_steps=10)
 
-model_name = os.getenv("MODEL_NAME", "Transformer")
+    # ──────────────────────────────────────────────────────────────────────────
+    # 6. 运行时峰值显存 & 耗时对比
+    #
+    # 方法论说明：
+    #   - baseline   : compiled_transformer（Inductor 全优化路径）
+    #   - recomputed : 手动 autograd.Function 包装（未经 Inductor）
+    #   两者执行引擎不同，内存差异（~143 MB）较为可信，
+    #   时间差异含执行引擎因素，仅作参考。
+    #   使用独立的 profiling 专用优化器，与阶段 5 的参数状态相互隔离。
+    # ──────────────────────────────────────────────────────────────────────────
+    print("\n[4/4] 开始运行时峰值显存 & 耗时对比...")
 
-# 保存到:
-#   IR_artifacts/<model_name>/runs/<RUN_ID>/recompute/FW_recomputed.dot
-#   IR_artifacts/<model_name>/runs/<RUN_ID>/recompute/BW_recomputed.dot
-save_ir_and_dot(
-    fw_gm_opt,
-    model_name=model_name,
-    subfolder="recompute",
-    graph_name="FW_recomputed",
-)
-save_ir_and_dot(
-    bw_gm_opt,
-    model_name=model_name,
-    subfolder="recompute",
-    graph_name="BW_recomputed",
-)
+    # 独立的 profiling 优化器，避免与阶段 5 的训练互相污染梯度状态
+    _prof_opt_base = torch.optim.Adam(transformer.parameters(), lr=1e-4)
+    _prof_opt_recp = torch.optim.Adam(transformer.parameters(), lr=1e-4)
 
-print("全部完成！请在 IR_artifacts 目录下查看该模型对应的重计算图。")
+    def _baseline_step():
+        _prof_opt_base.zero_grad()
+        out = compiled_transformer(src_data, tgt_data[:, :-1])
+        l = criterion(out.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+        l.backward()
+        _prof_opt_base.step()
 
-# ==========================================
-# 阶段五：使用优化后的图进行真正的训练
-# ==========================================
-from aten_recompute.core.train_recomputed import run_training
+    def _recomp_step():
+        _prof_opt_recp.zero_grad()
+        out = _recomputed_forward(src_data, tgt_data[:, :-1])
+        l = criterion(out.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+        l.backward()
+        _prof_opt_recp.step()
 
-run_training(
-    fw_gm=fw_gm_opt,
-    bw_gm=bw_gm_opt,
-    model=transformer,
-    src_data=src_data,
-    tgt_data=tgt_data,
-    tgt_vocab_size=tgt_vocab_size,
-    criterion=criterion,
-    graph_capture=graph_capture,
-)
+    analyzer.profile_step("baseline",   fn=_baseline_step, warmup=2, steps=5)
+    analyzer.profile_step("recomputed", fn=_recomp_step,   warmup=2, steps=5)
+    analyzer.report()
+
+    # 追加写入运行时数据（save_report 覆盖写入完整 payload）
+    analyzer.save_report(model_name=model_name)
+    print("内存分析报告已更新。")
+
+
+if __name__ == "__main__":
+    main()
