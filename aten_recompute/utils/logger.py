@@ -23,7 +23,7 @@ class _ModulePathFormatter(logging.Formatter):
     @staticmethod
     def _to_module_path(abs_path: str) -> str:
         """将绝对路径转换为点分隔的模块路径（不含 .py 后缀）。"""
-        project_root = os.getenv("PROJECT_ROOT", os.getcwd())
+        project_root = _PROJECT_ROOT  # 使用模块级缓存，避免运行时调用 os.getenv 触发递归
         try:
             rel = os.path.relpath(abs_path, start=project_root)
         except ValueError:

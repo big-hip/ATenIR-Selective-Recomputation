@@ -1,0 +1,68 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            // 主入口：完整流程（图捕获 → RecomputePass → 训练验证 → 显存对比）
+            "name": "Run main.py (full pipeline)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/example/Transformer/main.py",
+            "cwd": "${workspaceFolder}/example/Transformer",
+            "python": "/user/tangchengxiang/miniconda3/envs/torch2.6-gpu/bin/python",
+            "env": {
+                "RECOMPUTE_LOG_LEVEL": "DEBUG",
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            // 只跑图捕获阶段，方便调试 CompilerBackend / AOT Autograd 行为
+            "name": "Debug: graph capture only",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/example/Transformer/main.py",
+            "cwd": "${workspaceFolder}/example/Transformer",
+            "python": "/user/tangchengxiang/miniconda3/envs/torch2.6-gpu/bin/python",
+            "env": {
+                "RECOMPUTE_LOG_LEVEL": "DEBUG",
+                "PYTHONPATH": "${workspaceFolder}",
+                // 设置此变量后可在 main.py 中加 early-exit 断点
+                "DEBUG_STOP_AFTER_CAPTURE": "1"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            // 调试 RecomputePass 本身（可在 Recom_pass.py 内打断点）
+            "name": "Debug: RecomputePass",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/example/Transformer/main.py",
+            "cwd": "${workspaceFolder}/example/Transformer",
+            "python": "/user/tangchengxiang/miniconda3/envs/torch2.6-gpu/bin/python",
+            "env": {
+                "RECOMPUTE_LOG_LEVEL": "DEBUG",
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            // 建议在 Recom_pass.py 中 run() 方法开头打断点后再启动此配置
+            "stopOnEntry": false
+        },
+        {
+            // 调试 meta['val'] 分布式变换演示（Step1~4）
+            "name": "Debug: dist_meta_demo",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/example/meta_shape_demo/dist_meta_demo.py",
+            "cwd": "${workspaceFolder}",
+            "python": "/user/tangchengxiang/miniconda3/envs/torch2.6-gpu/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}

@@ -7,6 +7,7 @@ GraphCapture：通过 torch.compile 的自定义 backend 捕获 FW/BW GraphModul
 import copy
 import os
 from collections import deque
+from typing import Optional
 
 import torch
 import torch.fx as fx
@@ -103,16 +104,23 @@ class GraphCapture:
     # ── 图清理 ────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def cleanup_graph(gm: fx.GraphModule) -> fx.GraphModule:
+    def cleanup_graph(
+        gm: fx.GraphModule,
+        rename_map: Optional[dict] = None,
+    ) -> fx.GraphModule:
         """
         在图交给训练执行之前，清理分析阶段注入的残留。
 
         Pass 1：将所有 mark_layer 节点替换为其输入张量（mark_layer 是恒等映射）。
+                若提供 rename_map，同时记录 {mark_layer节点名: 替换节点名} 映射，
+                调用方可据此修正配套 BW 图的 placeholder 名字。
         Pass 2：清除所有节点 kwargs 中的 layer_Rank 残留键。
 
         Parameters
         ----------
-        gm : 待清理的 GraphModule（原地修改）。
+        gm         : 待清理的 GraphModule（原地修改）。
+        rename_map : 若不为 None，Pass 1 会将替换记录写入此 dict；
+                     用于在 "Pass 前 FX 图" 场景中同步修正配套 BW 图的 placeholder。
 
         Returns
         -------
@@ -124,10 +132,13 @@ class GraphCapture:
         """
         graph = gm.graph
 
-        # Pass 1：替换 mark_layer 节点
+        # Pass 1：替换 mark_layer 节点，按需记录名字映射
         for node in list(graph.nodes):
             if node.op == 'call_function' and 'mark_layer' in str(node.target):
-                node.replace_all_uses_with(node.args[0])
+                replacement = node.args[0]
+                if rename_map is not None:
+                    rename_map[node.name] = replacement.name
+                node.replace_all_uses_with(replacement)
                 graph.erase_node(node)
 
         remaining = [

@@ -84,9 +84,19 @@ def main():
     # _modify_forward_graph 原地修改 fw_gm，估算"之前"状态必须用快照。
     _fw_before = copy.deepcopy(graph_capture.fw_gm)
     _bw_before = copy.deepcopy(graph_capture.bw_gm)
+    # 额外保留一份，供 eager 模式对比用（不能复用 _fw_before，它要给静态分析用）
+    _fw_for_eager = copy.deepcopy(graph_capture.fw_gm)
+    _bw_for_eager = copy.deepcopy(graph_capture.bw_gm)
 
+    # JIT pass（默认）
     recompute_pass = RecomputePass({"FW": graph_capture.fw_gm, "BW": graph_capture.bw_gm})
-    fw_gm_opt, bw_gm_opt = recompute_pass.run()   # run() 现在返回 (fw_gm, bw_gm)
+    fw_gm_opt, bw_gm_opt = recompute_pass.run()
+
+    # Eager pass（在独立拷贝上运行，供运行时对比）
+    recompute_pass_eager = RecomputePass(
+        {"FW": _fw_for_eager, "BW": _bw_for_eager}, mode='eager'
+    )
+    fw_gm_eager, bw_gm_eager = recompute_pass_eager.run()
 
     # ──────────────────────────────────────────────────────────────────────────
     # 3.5 静态激活内存估算（cleanup 之前，meta['val'] 仍完整）
@@ -101,8 +111,10 @@ def main():
     analyzer.save_report(model_name=model_name)   # 静态结果立即落盘
 
     # 清理图中分析阶段残留（mark_layer / layer_Rank）
-    fw_gm_opt = GraphCapture.cleanup_graph(fw_gm_opt)
-    bw_gm_opt = GraphCapture.cleanup_graph(bw_gm_opt)
+    fw_gm_opt   = GraphCapture.cleanup_graph(fw_gm_opt)
+    bw_gm_opt   = GraphCapture.cleanup_graph(bw_gm_opt)
+    fw_gm_eager = GraphCapture.cleanup_graph(fw_gm_eager)
+    bw_gm_eager = GraphCapture.cleanup_graph(bw_gm_eager)
     print("重计算 Pass 运行完毕！")
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -121,7 +133,7 @@ def main():
     else:
         _params_flat = _collect_params_in_fw_order(transformer)
 
-    _recomputed_forward = make_recomputed_fn(fw_gm_opt, bw_gm_opt, _params_flat)
+    _recomputed_forward = make_recomputed_fn(fw_gm_opt, bw_gm_opt, _params_flat)   # JIT 模式
     _optimizer = torch.optim.Adam(transformer.parameters(), lr=1e-4, betas=(0.9, 0.98), eps=1e-9)
 
     def _recomputed_step():
@@ -141,37 +153,82 @@ def main():
     # 6. 运行时峰值显存 & 耗时对比
     #
     # 方法论说明：
-    #   - baseline   : compiled_transformer（Inductor 全优化路径）
-    #   - recomputed : 手动 autograd.Function 包装（未经 Inductor）
-    #   两者执行引擎不同，内存差异（~143 MB）较为可信，
-    #   时间差异含执行引擎因素，仅作参考。
+    #   四路对比（全部使用同一引擎 Python FX，除 ④ 外）：
+    #   ① no_recompute      : Pass 前 FX 图，纯 Python FX 执行（基准）
+    #                         save-everything，无 min-cut（default_partition 无
+    #                         must_recompute 标签时回落"全部保存"模式）
+    #   ② recomputed_jit    : JIT 延迟共享插入，链在第一个 consumer 前实体化
+    #   ③ recomputed_eager  : Eager 插入（旧行为），所有链在 BW 开头同时实体化
+    #   ④ inductor_baseline : torch.compile Inductor 全优化路径（不同引擎，仅作参考）
+    #
+    #   ① → ② 差异：重计算 Pass 的纯效果（选对目标时应为负，即节省内存）。
+    #   ② → ③ 差异：JIT vs Eager 插入策略的显存差异，体现 JIT 延迟共享的价值。
     #   使用独立的 profiling 专用优化器，与阶段 5 的参数状态相互隔离。
     # ──────────────────────────────────────────────────────────────────────────
     print("\n[4/4] 开始运行时峰值显存 & 耗时对比...")
 
-    # 独立的 profiling 优化器，避免与阶段 5 的训练互相污染梯度状态
-    _prof_opt_base = torch.optim.Adam(transformer.parameters(), lr=1e-4)
-    _prof_opt_recp = torch.optim.Adam(transformer.parameters(), lr=1e-4)
+    # ── 构建 no-recompute baseline（Pass 前 FX 图，同引擎） ──────────────────
+    # cleanup_graph 返回 rename_map：{mark_layer节点名: 替换节点名}
+    # 若 mark_layer 节点曾出现在 FW 输出中（作为 FW→BW 边界张量），
+    # BW 图中对应的 placeholder 名字需同步修正，否则 _detect_fw_calling_convention 会出错。
+    _ml_rename: dict = {}
+    _fw_no_rc = GraphCapture.cleanup_graph(copy.deepcopy(_fw_before), _ml_rename)
+    _bw_no_rc = copy.deepcopy(_bw_before)
+    for _node in _bw_no_rc.graph.nodes:
+        if _node.op == 'placeholder' and _node.name in _ml_rename:
+            _node.name = _ml_rename[_node.name]
+        if 'layer_Rank' in _node.kwargs:
+            _node.kwargs = {k: v for k, v in _node.kwargs.items() if k != 'layer_Rank'}
+    _bw_no_rc.graph.lint()
+    _bw_no_rc.recompile()
 
-    def _baseline_step():
-        _prof_opt_base.zero_grad()
-        out = compiled_transformer(src_data, tgt_data[:, :-1])
+    _no_recompute_forward = make_recomputed_fn(_fw_no_rc, _bw_no_rc, _params_flat)
+
+    # ── 构建 eager forward（fw_gm_eager / bw_gm_eager 已在阶段 3 中准备好） ──
+    _eager_forward = make_recomputed_fn(fw_gm_eager, bw_gm_eager, _params_flat)
+
+    # ── 四个独立优化器，避免各路梯度状态互相污染 ─────────────────────────────
+    _prof_opt_no_rc    = torch.optim.Adam(transformer.parameters(), lr=1e-4)
+    _prof_opt_jit      = torch.optim.Adam(transformer.parameters(), lr=1e-4)
+    _prof_opt_eager    = torch.optim.Adam(transformer.parameters(), lr=1e-4)
+    _prof_opt_inductor = torch.optim.Adam(transformer.parameters(), lr=1e-4)
+
+    def _no_recompute_step():
+        _prof_opt_no_rc.zero_grad()
+        out = _no_recompute_forward(src_data, tgt_data[:, :-1])
         l = criterion(out.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
         l.backward()
-        _prof_opt_base.step()
+        _prof_opt_no_rc.step()
 
-    def _recomp_step():
-        _prof_opt_recp.zero_grad()
+    def _recomp_jit_step():
+        _prof_opt_jit.zero_grad()
         out = _recomputed_forward(src_data, tgt_data[:, :-1])
         l = criterion(out.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
         l.backward()
-        _prof_opt_recp.step()
+        _prof_opt_jit.step()
 
-    analyzer.profile_step("baseline",   fn=_baseline_step, warmup=2, steps=5)
-    analyzer.profile_step("recomputed", fn=_recomp_step,   warmup=2, steps=5)
+    def _recomp_eager_step():
+        _prof_opt_eager.zero_grad()
+        out = _eager_forward(src_data, tgt_data[:, :-1])
+        l = criterion(out.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+        l.backward()
+        _prof_opt_eager.step()
+
+    def _inductor_step():
+        _prof_opt_inductor.zero_grad()
+        out = compiled_transformer(src_data, tgt_data[:, :-1])
+        l = criterion(out.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+        l.backward()
+        _prof_opt_inductor.step()
+
+    # no_recompute 为基准，report() 将自动显示各路与它的差异
+    analyzer.profile_step("no_recompute",      fn=_no_recompute_step,  warmup=2, steps=5)
+    analyzer.profile_step("recomputed_jit",    fn=_recomp_jit_step,    warmup=2, steps=5)
+    analyzer.profile_step("recomputed_eager",  fn=_recomp_eager_step,  warmup=2, steps=5)
+    analyzer.profile_step("inductor_baseline", fn=_inductor_step,      warmup=2, steps=5)
     analyzer.report()
 
-    # 追加写入运行时数据（save_report 覆盖写入完整 payload）
+    # 覆盖写入完整报告（含运行时数据）
     analyzer.save_report(model_name=model_name)
     print("内存分析报告已更新。")
 

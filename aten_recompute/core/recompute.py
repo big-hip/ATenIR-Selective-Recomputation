@@ -20,16 +20,26 @@ class ActivationRecomputation:
     2. Modify the backward graph to insert the recomputation path.
     3. Modify the forward graph to adjust its outputs to support the recomputation flow and eliminate dead code.
     """
-    def __init__(self, fw_gm: fx.GraphModule = None, bw_gm: fx.GraphModule = None):
+    def __init__(
+        self,
+        fw_gm: fx.GraphModule = None,
+        bw_gm: fx.GraphModule = None,
+        mode: str = 'jit',
+    ):
         """
         Initializes the ActivationRecomputationPass.
 
         Args:
-            fw_gm (fx.GraphModule, optional): The forward computation graph module. Defaults to None.
-            bw_gm (fx.GraphModule, optional): The backward computation graph module. Defaults to None.
+            fw_gm  : The forward computation graph module.
+            bw_gm  : The backward computation graph module.
+            mode   : 'jit'   — JIT 惰性插入（默认），每个 BW consumer 独立拥有
+                               一份重计算链，用完即释放，峰值显存最低；
+                     'eager' — 急切插入（旧行为），每个激活只插入一份，所有
+                               chain 同时驻留，调试/对比用。
         """
         self.fw_gm = fw_gm
         self.bw_gm = bw_gm
+        self.mode  = mode
         if fw_gm and bw_gm:
             self.re_init_maps()
         else:
@@ -81,7 +91,10 @@ class ActivationRecomputation:
         # 2. 修改反向图：将重计算子图插入 BW，替换原有 saved placeholder
         logger.debug("True activations to recompute: %s", true_activations_to_recompute_name)
         logger.debug("Sorted nodes to insert: %s", sorted_nodes_to_insert)
-        self._modify_backward_graph(true_activations_to_recompute_name, sorted_nodes_to_insert)
+        if self.mode == 'jit':
+            self._modify_backward_graph_jit(true_activations_to_recompute_name, sorted_nodes_to_insert)
+        else:
+            self._modify_backward_graph_eager(true_activations_to_recompute_name, sorted_nodes_to_insert)
 
         # 3. 修改前向图：更新输出节点，执行死代码消除
         self._modify_forward_graph(activation_node_names, true_activations_to_recompute_name)
@@ -327,7 +340,7 @@ class ActivationRecomputation:
 
         logger.debug(f"Manual cleanup complete. Removed {deleted_node_count} unused nodes.")
 
-    def _modify_backward_graph(self, activations_to_replace: List[str], sorted_nodes_to_insert: List[Node]):
+    def _modify_backward_graph_eager(self, activations_to_replace: List[str], sorted_nodes_to_insert: List[Node]):
         """
         Inserts recomputed nodes into the backward graph.
         """
@@ -432,6 +445,169 @@ class ActivationRecomputation:
                 )
         
         logger.debug(f"Successfully replaced {replaced_count} / {len(placeholders_to_replace)} old placeholders.")
+        self.re_init_maps()
+
+    def _modify_backward_graph_jit(
+        self,
+        activations_to_replace: List[str],
+        sorted_nodes_to_insert: List[Node],
+    ) -> None:
+        """
+        JIT（延迟共享）重计算插入。
+
+        核心策略：
+          · 每个 FW 依赖节点全局只插入一次（由 global_node_map 保证），
+            所有消费同一激活的 BW 节点共享同一份重计算结果——与 eager 模式相同
+            的节点总量，但插入位置尽可能靠后。
+          · 每条激活链被插入到该激活在 BW 图中第一个消费者的紧前方
+            （而不是 eager 模式的 BW 开头），从而在反向传播执行时尽量推迟激活的
+            生命周期，减少与其他激活张量的共存时间。
+          · 使用迭代后序 DFS 替代递归，避免深依赖链超出 Python 栈上限。
+
+        预期效果（与 eager 对比）：
+          · 节点数量相同，不会因为 per-consumer 复制导致显存爆炸；
+          · 靠后插入使各层激活的生命周期不重叠，峰值显存低于 eager。
+        """
+        recomputed_fw_names: Set[str] = {n.name for n in sorted_nodes_to_insert}
+        fw_recomputed_by_name: Dict[str, fx.Node] = {
+            n.name: n for n in sorted_nodes_to_insert
+        }
+
+        # 收集需要被替换的 BW placeholder
+        placeholders_to_replace: Dict[str, fx.Node] = {}
+        for act_name in activations_to_replace:
+            ph = self.bw_name_to_node.get(act_name)
+            if ph and ph.users:
+                placeholders_to_replace[act_name] = ph
+
+        if not placeholders_to_replace:
+            return
+
+        # BW 节点的拓扑位置（用于找 first consumer）
+        bw_topo_pos: Dict[fx.Node, int] = {
+            n: i for i, n in enumerate(self.bw_gm.graph.nodes)
+        }
+
+        # global_node_map: fw_node → bw_node
+        # 每个 FW 依赖节点只插入一次，后续激活共享
+        global_node_map: Dict[fx.Node, fx.Node] = {}
+
+        def _insert_chain(fw_target: fx.Node, insert_before: fx.Node) -> Optional[fx.Node]:
+            """
+            迭代后序 DFS：将 fw_target 的完整重计算链插入到 insert_before 之前。
+            已在 global_node_map 中的节点直接复用，不重复插入。
+            返回 fw_target 对应的新 BW 节点。
+            """
+            if fw_target in global_node_map:
+                return global_node_map[fw_target]
+
+            # ── 步骤 1：迭代后序 DFS，收集待插入节点的拓扑顺序 ──────────────
+            post_order: List[fx.Node] = []
+            visited: Set[int] = set()   # id(fw_node)
+            in_stack: Set[int] = set()
+            dfs_stack: List[Tuple[fx.Node, bool]] = [(fw_target, False)]
+
+            while dfs_stack:
+                node, expanded = dfs_stack.pop()
+                nid = id(node)
+                if node in global_node_map or nid in visited:
+                    continue
+                if expanded:
+                    post_order.append(node)
+                    visited.add(nid)
+                    in_stack.discard(nid)
+                else:
+                    dfs_stack.append((node, True))
+                    in_stack.add(nid)
+                    for arg in node.all_input_nodes:
+                        if arg.name in recomputed_fw_names:
+                            child = fw_recomputed_by_name[arg.name]
+                            cid = id(child)
+                            if child not in global_node_map \
+                                    and cid not in visited \
+                                    and cid not in in_stack:
+                                dfs_stack.append((child, False))
+
+            # ── 步骤 2：按后序依次在 insert_before 前插入 BW 节点 ────────────
+            result: Optional[fx.Node] = None
+            for fw_n in post_order:
+                if fw_n in global_node_map:
+                    result = global_node_map[fw_n]
+                    continue
+
+                def resolve_arg(arg: fx.Node, _n=fw_n) -> Optional[fx.Node]:
+                    if arg.name in recomputed_fw_names:
+                        bw_dep = global_node_map.get(fw_recomputed_by_name[arg.name])
+                        if bw_dep is None:
+                            logger.warning(
+                                "[JIT] 后序节点 '%s' 的依赖 '%s' 不在 global_node_map 中。",
+                                _n.name, arg.name,
+                            )
+                        return bw_dep
+                    bw_nd = self.bw_name_to_node.get(arg.name)
+                    if bw_nd is None:
+                        logger.warning(
+                            "[JIT] FW arg '%s' 在 BW 图中找不到对应节点，跳过。", arg.name
+                        )
+                    return bw_nd
+
+                new_args = fx.node.map_arg(fw_n.args, resolve_arg)
+                clean_kwargs = {k: v for k, v in fw_n.kwargs.items() if k != 'layer_Rank'}
+                new_kwargs = fx.node.map_arg(clean_kwargs, resolve_arg)
+
+                with self.bw_gm.graph.inserting_before(insert_before):
+                    new_node = self.bw_gm.graph.create_node(
+                        op=fw_n.op,
+                        target=fw_n.target,
+                        args=new_args,
+                        kwargs=new_kwargs,
+                    )
+                    new_node.meta = copy.copy(fw_n.meta)
+
+                self.bw_name_to_node[new_node.name] = new_node
+                global_node_map[fw_n] = new_node
+                result = new_node
+                logger.debug("[JIT] 插入节点 '%s' (before '%s')",
+                             new_node.name, insert_before.name)
+
+            if result is None:
+                result = global_node_map.get(fw_target)
+            return result
+
+        # ── 主循环：按 first-consumer 位置从早到晚处理各激活 ────────────────
+        # 按第一个消费者在 BW 中的位置排序，保证依赖关系的插入顺序正确
+        def _first_consumer_pos(act_name: str) -> int:
+            ph = placeholders_to_replace[act_name]
+            return min(
+                (bw_topo_pos.get(c, 0) for c in ph.users.keys()),
+                default=0,
+            )
+
+        sorted_acts = sorted(placeholders_to_replace.keys(), key=_first_consumer_pos)
+
+        for act_name in sorted_acts:
+            old_ph = placeholders_to_replace[act_name]
+            fw_target = self.fw_name_to_node.get(act_name)
+            if fw_target is None:
+                raise RuntimeError(
+                    f"[JIT] FW 节点 '{act_name}' 在 fw_name_to_node 中不存在。"
+                )
+
+            consumers = list(old_ph.users.keys())
+            first_consumer = min(consumers, key=lambda c: bw_topo_pos.get(c, 0))
+            logger.debug("[JIT] 激活 '%s' 第一个 consumer: '%s' (pos=%d)",
+                         act_name, first_consumer.name, bw_topo_pos.get(first_consumer, -1))
+
+            jit_node = _insert_chain(fw_target, first_consumer)
+            if jit_node is None:
+                logger.warning("[JIT] 激活 '%s' 的链插入返回 None，跳过替换。", act_name)
+                continue
+
+            # 所有消费者共享同一个重计算结果
+            old_ph.replace_all_uses_with(jit_node)
+            self.bw_gm.graph.erase_node(old_ph)
+
+        logger.debug("[JIT] 完成 %d 个激活的延迟共享 JIT 替换。", len(sorted_acts))
         self.re_init_maps()
 
     def _topological_sort(self, nodes_to_sort: Set[fx.Node]) -> List[fx.Node]:

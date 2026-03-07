@@ -10,10 +10,13 @@ ActivationRecomputation 执行图变换。
     export RECOMPUTE='{"3": [0, 2]}'                             # 按步幅选层
     export RECOMPUTE='{"4": 0.5}'                                # 按比例选前 50%
     export RECOMPUTE='{"5": ["relu.default", "dropout.default"]}' # 按算子类型
+    export RECOMPUTE='{"6": null}'                               # 自动廉价（链深度=0）
+    export RECOMPUTE='{"6": 1}'                                  # 自动廉价（链深度≤1）
 """
 import os
 import json
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from collections import deque
+from typing import Any, Dict, List, Optional, Set, Tuple, Callable
 
 import torch.fx as fx
 
@@ -35,15 +38,20 @@ class RecomputePass:
         fw_gm_opt, bw_gm_opt = pass_.run()
     """
 
-    def __init__(self, graph_dict: Dict[str, fx.GraphModule]):
+    def __init__(self, graph_dict: Dict[str, fx.GraphModule], mode: str = 'jit'):
         """
         Parameters
         ----------
         graph_dict : {"FW": fw_gm, "BW": bw_gm}
             包含前向和反向 GraphModule 的字典。键名必须为 "FW" 和 "BW"。
+        mode : 'jit'（默认）或 'eager'
+            传递给 ActivationRecomputation 的插入模式。
+            'jit'   — JIT 惰性插入，每个 consumer 独立持有重计算链，峰值显存低；
+            'eager' — 急切插入（旧行为），所有 chain 共享一份，调试/对比用。
         """
         self.fw_gm: fx.GraphModule = graph_dict["FW"]
         self.bw_gm: fx.GraphModule = graph_dict["BW"]
+        self.mode: str = mode
 
         # 由 _get_activation_layer_ranks() 填充
         self.sorted_ranks: List[int] = []
@@ -64,6 +72,7 @@ class RecomputePass:
             "3": self._recompute_by_stride,
             "4": self._recompute_by_ratio,
             "5": self._recompute_by_op_type,
+            "6": self._recompute_cheap_auto,
         }
 
     # ── 环境变量解析 ──────────────────────────────────────────────────────────
@@ -139,7 +148,9 @@ class RecomputePass:
         logger.info(
             "[RecomputePass] 开始重计算 %d 个激活节点: %s", len(node_names), node_names
         )
-        self.fw_gm, self.bw_gm = ActivationRecomputation(self.fw_gm, self.bw_gm).run(node_names)
+        self.fw_gm, self.bw_gm = ActivationRecomputation(
+            self.fw_gm, self.bw_gm, mode=self.mode
+        ).run(node_names)
 
     def run(self) -> Tuple[fx.GraphModule, fx.GraphModule]:
         """
@@ -239,3 +250,108 @@ class RecomputePass:
             and n.target.__name__ in op_types
         ]
         self._run_recomputation(node_names)
+
+    # ── 策略 6：自动廉价重计算 ────────────────────────────────────────────────
+
+    def _chain_depth(
+        self,
+        fw_node: fx.Node,
+        boundary_names: Set[str],
+        fw_ph_names: Set[str],
+    ) -> int:
+        """
+        估算从 fw_node 出发的重计算链深度。
+
+        向上 BFS，遇到其他 FW→BW 边界节点或 FW placeholder 停止，
+        统计途经的"额外"中间节点数（不含 fw_node 本身）。
+
+        depth=0  → fw_node 的所有输入均来自边界/参数，单算子重计算，代价最低。
+        depth=1  → 链中多一层中间节点，依此类推。
+        """
+        depth = 0
+        queue: deque = deque([fw_node])
+        visited: Set[str] = {fw_node.name}
+        while queue:
+            n = queue.popleft()
+            for inp in n.all_input_nodes:
+                if inp.name in visited:
+                    continue
+                visited.add(inp.name)
+                # 遇到其他边界节点或 FW 参数/输入 → 停止追溯
+                if inp.name in boundary_names or inp.name in fw_ph_names:
+                    continue
+                depth += 1
+                queue.append(inp)
+        return depth
+
+    def _get_cheap_boundary_targets(self, max_chain_depth: int) -> List[str]:
+        """
+        从 FW→BW 边界的中间激活中，筛选链深度 ≤ max_chain_depth 的节点。
+
+        返回节点名列表，适合直接传入 _run_recomputation()。
+        """
+        bw_ph_names: Set[str] = {
+            n.name for n in self.bw_gm.graph.nodes if n.op == "placeholder"
+        }
+        fw_ph_names: Set[str] = {
+            n.name for n in self.fw_gm.graph.nodes if n.op == "placeholder"
+        }
+        output_node = get_output_node(self.fw_gm)
+        if output_node is None:
+            logger.warning("[RecomputePass] FW 图缺少 output 节点，策略 6 跳过。")
+            return []
+
+        # FW→BW 边界上的中间激活（排除透传的 FW placeholder，即参数/输入）
+        boundary_names: Set[str] = {
+            n.name
+            for n in output_node.all_input_nodes
+            if n.name in bw_ph_names and n.name not in fw_ph_names
+        }
+
+        cheap: List[str] = []
+        for name in boundary_names:
+            fw_node = self.fw_name_to_node.get(name)
+            if fw_node is None or fw_node.op == "placeholder":
+                continue
+            depth = self._chain_depth(fw_node, boundary_names - {name}, fw_ph_names)
+            logger.info(
+                "[RecomputePass] 边界节点 '%s' (target=%s) 链深度=%d",
+                name,
+                getattr(fw_node.target, "__name__", str(fw_node.target)),
+                depth,
+            )
+            if depth <= max_chain_depth:
+                cheap.append(name)
+
+        return cheap
+
+    def _recompute_cheap_auto(self, max_depth: Any) -> None:
+        """
+        策略 6：自动廉价重计算。
+
+        扫描 FW→BW 边界上的全部中间激活，只对"重计算链短"的节点做重计算：
+          depth=0（默认）→ 所有输入均来自边界/参数，单算子重计算，零额外中间张量
+          depth=1        → 链中再多一层中间节点
+
+        这是真正能降低峰值显存的策略：
+          · 保存目标激活代价：|activation_tensor|
+          · 重计算代价（BW 中间张量）：≈ 0（depth=0 时输入已在 BW 中）
+          · 净效果：节省 |activation_tensor| 字节的峰值显存
+
+        设置方式：
+            export RECOMPUTE='{"6": null}'  # 使用默认 depth=0（最严格）
+            export RECOMPUTE='{"6": 1}'     # 允许链深度 ≤ 1
+        """
+        if max_depth is None:
+            max_depth = 0
+        try:
+            max_depth = int(max_depth)
+        except (TypeError, ValueError):
+            max_depth = 0
+
+        logger.info("[RecomputePass] 策略 6：自动廉价重计算，链深度 ≤ %d。", max_depth)
+        cheap = self._get_cheap_boundary_targets(max_depth)
+        logger.info(
+            "[RecomputePass] 策略 6：找到 %d 个廉价目标: %s", len(cheap), cheap
+        )
+        self._run_recomputation(cheap)
