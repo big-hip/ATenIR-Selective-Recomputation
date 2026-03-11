@@ -1,160 +1,94 @@
 """
 Graph_compile_capture.py
 
-GraphCapture：通过 torch.compile 的自定义 backend 捕获 FW/BW GraphModule，
-并提供 cleanup_graph() 用于训练前清理图中的分析阶段残留。
+CompilerBackend：torch.compile 自定义后端，注入选择性重计算 partition_fn。
+切分后的 FW/BW 图直接交给 fw_compiler / bw_compiler 执行，无需手动包装。
 """
 import copy
 import os
-from collections import deque
 from typing import Optional
 
 import torch
 import torch.fx as fx
-from functorch.compile import make_boxed_func
 from torch._functorch.aot_autograd import aot_module_simplified
+from torch._guards import detect_fake_mode
+from torch._inductor.compile_fx import compile_fx_inner
+from torch._inductor.decomposition import select_decomp_table
+from torch._inductor.virtualized import V
 
+from ..core.partition import make_selective_partition_fn
 from ..utils.logger import get_logger
-from ..utils.save_ir import save_fx_module_code_and_graph, save_ir_and_dot
+from ..utils.save_ir import save_ir_and_dot
 
 logger = get_logger(__name__)
 
 
-class GraphCapture:
+class CompilerBackend:
     """
-    捕获模型的 AOT Autograd FW/BW 图。
+    torch.compile 自定义后端：注入选择性重计算 partition_fn。
 
-    工作流::
+    partition_fn 在 AOT Autograd 的 joint graph 切分阶段运行，
+    控制哪些中间激活保存、哪些在反向中重计算。切分后的 FW/BW 图
+    直接通过 fw_compiler / bw_compiler 执行。
 
-        gc = GraphCapture(model, *inputs)
-        compiled = gc.compile()        # 注册 backend 回调
-        compiled(*inputs)              # warm-up，触发真正的图捕获
+    用法::
+
+        backend = CompilerBackend(strategy_config={"6": 0})
+        compiled_model = torch.compile(model, backend=backend)
+
+        # 训练直接使用 compiled_model，无需额外包装
+        output = compiled_model(*inputs)
         loss.backward()
-        # gc.fw_gm / gc.bw_gm 现已可用
 
-    Attributes
+    Parameters
     ----------
-    fw_gm        : 捕获到的前向 GraphModule（warm-up 后填充）
-    bw_gm        : 捕获到的反向 GraphModule（backward 后填充）
-    fw_params_flat : 按前向访问顺序排列的模型参数/buffer 列表
+    strategy_config : dict, optional
+        重计算策略配置，格式与 RECOMPUTE 环境变量相同。
+        若为 None，则从 RECOMPUTE 环境变量读取。
+    save_ir : bool
+        是否保存切分后的 FW/BW 图 IR 产物。
     """
 
-    def __init__(self, model: torch.nn.Module, *inputs):
-        self.fw_gm = fx.GraphModule(torch.nn.Module(), fx.Graph())
-        self.bw_gm = fx.GraphModule(torch.nn.Module(), fx.Graph())
-        self.fw_params_flat: list = []
-        self.model = model
-        self.inputs = inputs
+    def __init__(self, strategy_config: Optional[dict] = None, save_ir: bool = False):
+        self.strategy_config = strategy_config
+        self.save_ir = save_ir
+        self.fw_gm: Optional[fx.GraphModule] = None
+        self.bw_gm: Optional[fx.GraphModule] = None
 
-    # ── backend 回调 ──────────────────────────────────────────────────────────
+    def __call__(self, gm: fx.GraphModule, sample_inputs: list):
+        """torch.compile backend 回调。"""
+        partition_fn = make_selective_partition_fn(self.strategy_config)
 
-    def inspect_backend(self, gm: fx.GraphModule, sample_inputs: list):
-        """
-        torch.compile backend：捕获 FW/BW 图并提取参数顺序。
-
-        sample_inputs 是 Dynamo 传入的真实张量（含模型参数），
-        按前向访问顺序排列，通过 data_ptr() 过滤出参数/buffer。
-        """
-        # 提取 FW 图 primal 的参数顺序（data_ptr 匹配）
-        all_params: dict = {}
-        for _, p in self.model.named_parameters(remove_duplicate=False):
-            all_params[p.data_ptr()] = p
-        for _, b in self.model.named_buffers():
-            all_params[b.data_ptr()] = b
-
-        seen: set = set()
-        fw_params: list = []
-        for t in sample_inputs:
-            if isinstance(t, torch.Tensor):
-                ptr = t.data_ptr()
-                if ptr in all_params and ptr not in seen:
-                    seen.add(ptr)
-                    fw_params.append(all_params[ptr])
-        self.fw_params_flat = fw_params
-
-        def fw(gm, _sample_inputs):
+        def fw_compiler(gm, _sample_inputs):
             self.fw_gm = copy.deepcopy(gm)
-            return make_boxed_func(gm.forward)
+            if self.save_ir:
+                model_name = os.getenv("MODEL_NAME", "default_model")
+                save_ir_and_dot(gm, model_name=model_name,
+                                subfolder="partition", graph_name="FW_partitioned")
+            return compile_fx_inner(gm, _sample_inputs)
 
-        def bw(gm, _sample_inputs):
+        def bw_compiler(gm, _sample_inputs):
             self.bw_gm = copy.deepcopy(gm)
-            return make_boxed_func(gm.forward)
+            if self.save_ir:
+                model_name = os.getenv("MODEL_NAME", "default_model")
+                save_ir_and_dot(gm, model_name=model_name,
+                                subfolder="partition", graph_name="BW_partitioned")
+            return compile_fx_inner(gm, _sample_inputs, is_backward=True)
 
-        return aot_module_simplified(gm, sample_inputs, fw_compiler=fw, bw_compiler=bw)
+        fake_mode = detect_fake_mode(sample_inputs)
+        if not fake_mode:
+            fake_mode = torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True)
 
-    # ── 编译入口 ──────────────────────────────────────────────────────────────
+        with V.set_fake_mode(fake_mode):
+            return aot_module_simplified(
+                gm, sample_inputs,
+                fw_compiler=fw_compiler,
+                bw_compiler=bw_compiler,
+                partition_fn=partition_fn,
+                decompositions=select_decomp_table(),
+            )
 
-    def compile(self) -> torch.nn.Module:
-        """
-        导出静态 FX 图并注册 inspect_backend，返回可调用的编译模型。
-        首次 forward + backward 调用时触发真正的图捕获。
-        """
-        import torch._dynamo as dynamo
 
-        fx_mod, _guards = dynamo.export(self.model, aten_graph=False)(*self.inputs)
-        fx_mod.graph.lint()
-        fx_mod.recompile()
-
-        model_name = os.getenv("MODEL_NAME", "default_model")
-        save_fx_module_code_and_graph(fx_mod, model_name=model_name, subfolder="capture")
-        save_ir_and_dot(fx_mod, model_name=model_name, subfolder="capture", graph_name="FW_capture")
-
-        return torch.compile(fx_mod, backend=self.inspect_backend, dynamic=True)
-
-    # ── 图清理 ────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def cleanup_graph(
-        gm: fx.GraphModule,
-        rename_map: Optional[dict] = None,
-    ) -> fx.GraphModule:
-        """
-        在图交给训练执行之前，清理分析阶段注入的残留。
-
-        Pass 1：将所有 mark_layer 节点替换为其输入张量（mark_layer 是恒等映射）。
-                若提供 rename_map，同时记录 {mark_layer节点名: 替换节点名} 映射，
-                调用方可据此修正配套 BW 图的 placeholder 名字。
-        Pass 2：清除所有节点 kwargs 中的 layer_Rank 残留键。
-
-        Parameters
-        ----------
-        gm         : 待清理的 GraphModule（原地修改）。
-        rename_map : 若不为 None，Pass 1 会将替换记录写入此 dict；
-                     用于在 "Pass 前 FX 图" 场景中同步修正配套 BW 图的 placeholder。
-
-        Returns
-        -------
-        清理并重编译后的同一个 GraphModule。
-
-        Raises
-        ------
-        AssertionError : 若 Pass 1 未能彻底移除所有 mark_layer 节点。
-        """
-        graph = gm.graph
-
-        # Pass 1：替换 mark_layer 节点，按需记录名字映射
-        for node in list(graph.nodes):
-            if node.op == 'call_function' and 'mark_layer' in str(node.target):
-                replacement = node.args[0]
-                if rename_map is not None:
-                    rename_map[node.name] = replacement.name
-                node.replace_all_uses_with(replacement)
-                graph.erase_node(node)
-
-        remaining = [
-            n for n in graph.nodes
-            if n.op == 'call_function' and 'mark_layer' in str(n.target)
-        ]
-        assert not remaining, (
-            f"cleanup_graph: Pass 1 未能移除 {len(remaining)} 个 mark_layer 节点: "
-            f"{[n.name for n in remaining]}"
-        )
-
-        # Pass 2：清除所有节点残留的 layer_Rank kwarg
-        for node in graph.nodes:
-            if 'layer_Rank' in node.kwargs:
-                node.kwargs = {k: v for k, v in node.kwargs.items() if k != 'layer_Rank'}
-
-        graph.lint()
-        gm.recompile()
-        return gm
+# ═══════════════════════════════════════════════════════════════════════════════
+#  旧 API 已删除。若需要旧 GraphCapture，请查看 git 历史。
+# ═══════════════════════════════════════════════════════════════════════════════

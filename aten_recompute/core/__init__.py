@@ -1,5 +1,7 @@
-from .recompute import ActivationRecomputation
-from .Recom_pass import RecomputePass
-from .train_recomputed import run_training
+from .partition import selective_recompute_partition, make_selective_partition_fn
 from .Tag import inject_layer_tags
-__all__ = ['ActivationRecomputation', 'RecomputePass', 'run_training', 'inject_layer_tags']
+
+__all__ = [
+    'selective_recompute_partition', 'make_selective_partition_fn',
+    'inject_layer_tags',
+]

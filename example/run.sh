@@ -2,8 +2,13 @@
 # =========================================================
 # 脚本名称: run.sh
 # 功能描述: 自动配置环境并运行指定 example 文件夹内的 main.py，并注入重计算策略
-# 使用方法: ./run.sh <模型样例目录> [重计算策略(1-5)]
-# 示例:     ./run.sh Transformer 1
+# 使用方法: ./run.sh <模型样例目录> [重计算策略(0-7)]
+# 示例:     ./run.sh Transformer 1      # 全部重计算
+#          ./run.sh Transformer 0      # 不重计算（baseline）
+#          ./run.sh Transformer 6      # 自动廉价（默认 depth=0）
+#          ./run.sh Transformer "6 2"  # 自动廉价 depth=2
+#          ./run.sh Transformer 7      # min-cut 最优重计算
+#          ./run.sh Transformer 7 0.5  # min-cut 预算模式（50%）
 #          ./run.sh Gpt2/gpt2_local 4
 # =========================================================
 
@@ -30,14 +35,27 @@ log_err()   { echo -e "${RED}[ERROR]${NC} $1"; }
 # =========================================================
 # 检查至少一个参数（模型目录名称）
 if [ -z "${1:-}" ]; then
-    echo -e "${YELLOW}用法:${NC} $0 <模型样例目录> [重计算策略(1-5)]"
-    echo -e "${YELLOW}示例 1:${NC} $0 Transformer 1"
-    echo -e "${YELLOW}示例 2:${NC} $0 Gpt2/gpt2_local 4"
+    echo -e "${YELLOW}用法:${NC} $0 <模型样例目录> [重计算策略(0-7)] [策略参数]"
+    echo -e ""
+    echo -e "  策略 0: 不重计算（baseline，等同 default_partition）"
+    echo -e "  策略 1: 全部重计算"
+    echo -e "  策略 2: 按名称关键字（默认 relu,dropout）"
+    echo -e "  策略 3: 按步幅选层（默认 start=0, stride=2）"
+    echo -e "  策略 4: 按比例选前 N%（默认 50%）"
+    echo -e "  策略 5: 按算子类型（默认 relu.default）"
+    echo -e "  策略 6: 自动廉价（默认 depth=0）"
+    echo -e "  策略 7: min-cut 最优重计算（默认 budget=1.0）"
+    echo -e ""
+    echo -e "${YELLOW}示例:${NC}"
+    echo -e "  $0 Transformer 0       # baseline"
+    echo -e "  $0 Transformer 1       # 全部重计算"
+    echo -e "  $0 Transformer 6       # 自动廉价 depth=0"
+    echo -e "  $0 Transformer \"6 2\"   # 自动廉价 depth=2"
     exit 1
 fi
 
 MODEL_DIR_NAME="$1"
-STRATEGY="${2:-1}" # 如果未指定策略，默认为 1
+STRATEGY="${2:-6}" # 如果未指定策略，默认为 6（自动廉价）
 
 # 路径解析
 # CURRENT_DIR 是 example 目录，项目根目录在其上一级
@@ -64,6 +82,10 @@ export PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}"
 export RECOMPUTE_LOG_LEVEL="DEBUG"
 
 case $STRATEGY in
+    0)
+        STRATEGY_DESC="策略 0: 不重计算（baseline）"
+        export RECOMPUTE='{"0": null}'
+        ;;
     1)
         STRATEGY_DESC="策略 1: 重计算所有激活值"
         export RECOMPUTE='{"1": null}'
@@ -84,10 +106,28 @@ case $STRATEGY in
         STRATEGY_DESC="策略 5: 按 Op Type 重计算"
         export RECOMPUTE='{"5": ["relu.default"]}'
         ;;
+    6)
+        DEPTH="${3:-0}"
+        STRATEGY_DESC="策略 6: 自动廉价（链深度 ≤ $DEPTH）"
+        export RECOMPUTE="{\"6\": $DEPTH}"
+        ;;
+    "6 "*)
+        # 支持 "6 2" 格式
+        DEPTH="${STRATEGY#6 }"
+        STRATEGY="6"
+        STRATEGY_DESC="策略 6: 自动廉价（链深度 ≤ $DEPTH）"
+        export RECOMPUTE="{\"6\": $DEPTH}"
+        ;;
+    7)
+        BUDGET="${3:-1.0}"
+        STRATEGY_DESC="策略 7: min-cut 最优重计算（memory_budget=$BUDGET）"
+        export RECOMPUTE="{\"7\": $BUDGET}"
+        ;;
     *)
-        log_warn "未知策略: $STRATEGY. 回退到策略 1."
-        STRATEGY_DESC="策略 1 (默认): 重计算所有激活值"
-        export RECOMPUTE='{"1": null}'
+        log_warn "未知策略: $STRATEGY. 回退到策略 0（不重计算）."
+        STRATEGY_DESC="策略 0 (默认): 不重计算"
+        STRATEGY="0"
+        export RECOMPUTE='{"0": null}'
         ;;
 esac
 
