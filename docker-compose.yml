@@ -1,0 +1,27 @@
+services:
+  atenir:
+    build: .
+    image: atenir-selective-recomputation
+    container_name: atenir
+
+    # GPU 支持（需要 NVIDIA Container Toolkit）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # 环境变量（可在此处覆盖策略）
+    environment:
+      - RECOMPUTE={"6": 0}
+      - RECOMPUTE_LOG_LEVEL=INFO
+      - MODEL_NAME=Transformer
+
+    # 将 IR 产物输出到宿主机，方便查看
+    volumes:
+      - ./IR_artifacts:/workspace/ATenIR-Selective-Recomputation/IR_artifacts
+
+    # 共享内存（PyTorch DataLoader 多进程需要）
+    shm_size: "4g"

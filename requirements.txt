@@ -1,0 +1,11 @@
+# Core (PyTorch 已通过 Docker 基础镜像 / conda 安装，此处不重复指定)
+# torch >= 2.1
+
+# 策略 7（min-cut 最优重计算）
+networkx>=3.0
+
+# 运行时内存分析（CPU 端 RSS 测量）
+psutil>=5.9
+
+# 内存分析图表
+matplotlib>=3.7

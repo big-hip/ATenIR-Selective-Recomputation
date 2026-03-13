@@ -1,5 +1,5 @@
 """
-Graph_compile_capture.py
+compiler.py
 
 CompilerBackend：torch.compile 自定义后端，注入选择性重计算 partition_fn。
 切分后的 FW/BW 图直接交给 fw_compiler / bw_compiler 执行，无需手动包装。
@@ -16,7 +16,7 @@ from torch._inductor.compile_fx import compile_fx_inner
 from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.virtualized import V
 
-from ..core.partition import make_selective_partition_fn
+from .partition import make_selective_partition_fn
 from ..utils.logger import get_logger
 from ..utils.save_ir import save_ir_and_dot
 

@@ -186,6 +186,10 @@ def _apply_strategy(
         if not param or len(param) != 2:
             logger.warning("[partition] 策略 3 配置格式错误，期望 [start, stride]，收到: %s", param)
             return []
+        if not sorted_ranks:
+            logger.warning("[partition] 策略 3 无层级信息（sorted_ranks 为空），"
+                           "请确认已调用 inject_layer_tags()。")
+            return []
         start, stride = int(param[0]), int(param[1])
         target_ranks = {
             rank for idx, rank in enumerate(sorted_ranks)
@@ -201,6 +205,10 @@ def _apply_strategy(
     if option == "4":
         # 策略 4：按比例选前 N% 层
         ratio = float(param) if param is not None else 0.5
+        if not sorted_ranks:
+            logger.warning("[partition] 策略 4 无层级信息（sorted_ranks 为空），"
+                           "请确认已调用 inject_layer_tags()。")
+            return []
         num_layers = int(len(sorted_ranks) * ratio)
         target_ranks = set(sorted_ranks[:num_layers])
         result = [
@@ -213,13 +221,16 @@ def _apply_strategy(
 
     if option == "5":
         # 策略 5：按算子类型
+        # 注意：ATen OpOverload 的 __name__ 返回 overload 名（如 "default"），
+        # 而非算子名。优先使用 _opname 属性获取真实算子名（如 "mm"）。
         op_types = param if isinstance(param, list) else [param]
-        result = [
-            sv for sv in saved_values
-            if sv.op == "call_function"
-            and hasattr(sv.target, "__name__")
-            and sv.target.__name__ in op_types
-        ]
+        def _match_op_type(sv):
+            if sv.op != "call_function":
+                return False
+            t = sv.target
+            name = getattr(t, "_opname", None) or getattr(t, "__name__", None)
+            return name in op_types
+        result = [sv for sv in saved_values if _match_op_type(sv)]
         logger.info("[partition] 策略 5：按算子类型 %s 匹配 %d 个节点。", op_types, len(result))
         return result
 

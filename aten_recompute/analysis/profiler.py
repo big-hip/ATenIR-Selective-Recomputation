@@ -1,5 +1,7 @@
 """
-memory_analysis.py
+profiler.py
+
+运行时 GPU 内存采样 + 报告生成。
 
 提供两类内存分析能力：
   1. 静态估算 — 通过比较 Pass 前后的 FX 图，从 meta['val'] 推导激活内存节省量，
@@ -9,30 +11,29 @@ memory_analysis.py
 
 典型用法::
 
-    from aten_recompute.utils.memory_analysis import MemoryAnalyzer
+    from aten_recompute.analysis import MemoryProfiler
 
-    analyzer = MemoryAnalyzer(device='cuda')
+    profiler = MemoryProfiler(device='cuda')
 
-    # 1. 静态估算（Pass 前后 FX 图对比）
-    analyzer.estimate(
-        fw_before=graph_capture.FW_gm, bw_before=graph_capture.BW_gm,
-        fw_after=fw_gm_opt,            bw_after=bw_gm_opt,
-    )
+    # 1. 模型参数常驻显存估算（可选，作为对比参考）
+    profiler.estimate_parameter_memory(model)
 
-    # 2. 模型参数常驻显存估算（可选，作为对比参考）
-    analyzer.estimate_parameter_memory(model)
+    # 2. 运行时对比（推荐：分阶段模式，自动分离 FW/BW/Opt 计时）
+    profiler.profile_step("baseline",
+                          forward_fn=lambda: criterion(model(x), y),
+                          optimizer=opt)
+    profiler.profile_step("recomputed",
+                          forward_fn=lambda: criterion(recomp_model(x), y),
+                          optimizer=recomp_opt)
+    profiler.report()
 
-    # 3. 运行时对比（传入封装好的训练步骤可调用对象）
-    analyzer.profile_step("baseline",   fn=baseline_step_fn)
-    analyzer.profile_step("recomputed", fn=recomputed_step_fn)
-    analyzer.report()
-
-    # 4. 保存报告 JSON 到 IR_artifacts
-    analyzer.save_report(model_name="Transformer")
+    # 3. 保存报告 JSON 到 IR_artifacts
+    profiler.save_report(model_name="Transformer")
 """
 
 import json
 import os
+import statistics
 import time
 from typing import Callable, Dict, List, Optional
 
@@ -40,8 +41,10 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 
-from .logger import get_logger
-from .graph_utils import get_output_node, get_saved_activations
+from ..utils.logger import get_logger
+from ..utils.graph_utils import get_output_node, get_saved_activations
+from ._activations import _fmt_bytes, _tensor_bytes, _saved_activation_bytes
+
 logger = get_logger(__name__)
 
 try:
@@ -81,7 +84,7 @@ try:
         plt.rcParams['axes.unicode_minus'] = False
     else:
         # 无 CJK 字体：保持 matplotlib 默认字体，图表标签使用英文
-        logger.debug("[MemoryAnalyzer] 未检测到 CJK 字体，图表将使用英文标签。")
+        logger.debug("[MemoryProfiler] 未检测到 CJK 字体，图表将使用英文标签。")
 
     _MPL_AVAILABLE = True
 except ImportError:
@@ -89,139 +92,30 @@ except ImportError:
     _MPL_AVAILABLE = False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 内部工具
-# ─────────────────────────────────────────────────────────────────────────────
+def _median(seq):
+    """计算中位数；空序列返回 0.0。"""
+    return statistics.median(seq) if seq else 0.0
 
-def _fmt_bytes(n) -> str:
-    """将字节数格式化为易读的 KB / MB / GB 字符串。
-    兼容 SymInt / SymFloat：先用 float() 强制具化，若失败则返回占位符。
+
+def _iqr_mean(seq):
     """
-    try:
-        n = float(n)
-    except (TypeError, RuntimeError):
-        return "? B (symbolic)"
-    if n == 0:
-        return "0 B"
-    for unit, threshold in [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)]:
-        if abs(n) >= threshold:
-            return f"{n / threshold:.2f} {unit}"
-    return f"{int(n)} B"
+    IQR 修剪均值：去掉 Q1 以下和 Q3 以上的异常值后取均值。
 
-
-def _tensor_bytes(val) -> int:
-    """从 FakeTensor / 真实 Tensor 估算字节数；非 Tensor 或符号形状无法具化时返回 0。
-
-    dynamic=True 追踪时 numel() 返回 SymInt，但 SymInt 携带样本的具体值，
-    int() 可以安全具化。若形状纯符号（无法具化）则捕获异常跳过。
+    与 torch.utils.benchmark.Timer 使用相同的统计策略，
+    对 GPU 热降频 / DVFS 等引起的离群点具有鲁棒性。
+    空序列或样本不足（< 4）时回退到普通中位数。
     """
-    if val is None or not isinstance(val, torch.Tensor):
-        return 0
-    try:
-        numel = int(val.numel())   # 具化 SymInt → plain int
-    except (TypeError, RuntimeError):
-        return 0
-    return numel * val.element_size()
+    n = len(seq)
+    if n < 4:
+        return _median(seq)
+    s = sorted(seq)
+    q1 = s[n // 4]
+    q3 = s[3 * n // 4]
+    trimmed = [x for x in s if q1 <= x <= q3]
+    return sum(trimmed) / len(trimmed) if trimmed else _median(seq)
 
 
-def _saved_activation_bytes(
-    fw_gm: fx.GraphModule,
-    bw_gm: fx.GraphModule,
-) -> Dict:
-    """
-    统计 FW→BW 边界上保存的张量，并将其分类为：
-      - activations : FW 中间计算结果（op != 'placeholder'），是重计算真正要消除的对象
-      - primals     : FW placeholder 节点直接透传给 BW（模型参数），本就长驻显存，
-                      重计算无法"节省"这部分，但添加新的 primal 会让此类增加
-
-    Returns:
-        {
-            'activation_bytes':  int,       中间激活的估算总字节数（重计算的真实节省来源）
-            'primal_bytes':      int,       参数透传的估算总字节数（参考用）
-            'total_bytes':       int,       两者之和
-            'num_activations':   int,       中间激活数量
-            'num_primals':       int,       参数透传数量
-            'skipped':           int,       meta 缺失 / 非张量，跳过的节点数
-            'activation_details': list,    中间激活的详情列表
-            'primal_details':    list,      参数透传的详情列表
-        }
-    """
-    # 构建 FW 图的 placeholder 名称集，用于判断一个 FW output 节点是否为 primal
-    fw_placeholder_names = {
-        n.name for n in fw_gm.graph.nodes if n.op == 'placeholder'
-    }
-
-    bw_ph_names = {
-        n.name
-        for n in bw_gm.graph.nodes
-        if n.op == 'placeholder' and not n.name.startswith('tangents_')
-    }
-
-    output_node = get_output_node(fw_gm)   # 使用 graph_utils 工具
-    if output_node is None:
-        return {
-            'activation_bytes': 0, 'primal_bytes': 0, 'total_bytes': 0,
-            'num_activations': 0, 'num_primals': 0, 'skipped': 0,
-            'activation_details': [], 'primal_details': [],
-        }
-
-    act_details:    List[Dict] = []
-    primal_details: List[Dict] = []
-    act_bytes    = 0
-    primal_bytes = 0
-    skipped      = 0
-
-    for node in output_node.all_input_nodes:
-        if node.name not in bw_ph_names:
-            continue
-        val = node.meta.get('val')
-        if val is None or not isinstance(val, torch.Tensor):
-            skipped += 1
-            logger.debug(
-                "[MemoryAnalyzer] 节点 '%s' meta['val'] 缺失或非 Tensor，跳过。",
-                node.name,
-            )
-            continue
-
-        nb = _tensor_bytes(val)
-        entry = {
-            'name':  node.name,
-            'shape': [int(d) for d in val.shape],   # SymInt → plain int，保证 JSON 可序列化
-            'dtype': str(val.dtype),
-            'bytes': nb,
-        }
-
-        # 判断是 primal（参数透传）还是中间激活
-        if node.name in fw_placeholder_names:
-            primal_bytes += nb
-            primal_details.append(entry)
-        else:
-            act_bytes += nb
-            act_details.append(entry)
-
-    if skipped:
-        logger.debug(
-            "[MemoryAnalyzer] %d 个节点（标量 / SymInt）无法估算，已跳过。",
-            skipped,
-        )
-
-    return {
-        'activation_bytes':  act_bytes,
-        'primal_bytes':      primal_bytes,
-        'total_bytes':       act_bytes + primal_bytes,
-        'num_activations':   len(act_details),
-        'num_primals':       len(primal_details),
-        'skipped':           skipped,
-        'activation_details': act_details,
-        'primal_details':    primal_details,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 主类
-# ─────────────────────────────────────────────────────────────────────────────
-
-class MemoryAnalyzer:
+class MemoryProfiler:
     """
     重计算效果分析器。
 
@@ -240,8 +134,8 @@ class MemoryAnalyzer:
     def __init__(self, device: str = 'cuda'):
         self.device = device
         self._static_result: Optional[Dict] = None
-        self._static_reported: bool = False        # Fix 1: 防止 report() 重复打印静态报告
-        self._param_memory: Optional[Dict] = None  # Fix 7: 模型参数常驻显存估算结果
+        self._static_reported: bool = False
+        self._param_memory: Optional[Dict] = None
         self._runtime_results: Dict[str, Dict] = {}
 
     # ── 静态估算 ──────────────────────────────────────────────────────────────
@@ -283,12 +177,12 @@ class MemoryAnalyzer:
             'saved_bytes': saved,
             'saved_ratio': ratio,
         }
-        self._static_reported = True  # Fix 1: 标记已打印，report() 不再重复打印
+        self._static_reported = True
         self._print_static_report(self._static_result)
         return self._static_result
 
     def _print_static_report(self, r: Dict) -> None:
-        line = "─" * 64
+        line = "─" * 68
         before, after = r['before'], r['after']
 
         # 找出被消除/新增的中间激活
@@ -301,8 +195,8 @@ class MemoryAnalyzer:
         added_primals = [d for d in after['primal_details'] if d['name'] not in before_primal_names]
 
         print(f"\n{line}")
-        print("  [静态激活内存估算]  基于 FX 图 meta['val'] 推导，无需实际运行")
-        print(f"  注：DOT 文件展示所有计算节点，此处仅统计跨越 FW→BW 边界的节点")
+        print("  静态激活内存估算（基于 FX 图 meta['val'] 推导，无需实际运行）")
+        print(f"  注: 此处仅统计跨越 FW→BW 边界的节点")
         print(line)
 
         # ── 汇总表 ──
@@ -315,7 +209,7 @@ class MemoryAnalyzer:
         print(f"  {'Pass 后':<8} {after['num_activations']:>8} "
               f"{_fmt_bytes(after['activation_bytes']):>14}  "
               f"{after['num_primals']:>8} {_fmt_bytes(after['primal_bytes']):>14}")
-        print(f"  {'─'*62}")
+        print(f"  {'─'*66}")
 
         if r['saved_bytes'] >= 0:
             print(f"  ✓ 节省中间激活内存: {_fmt_bytes(r['saved_bytes'])}  "
@@ -349,9 +243,7 @@ class MemoryAnalyzer:
             if len(remaining) > 5:
                 print(f"    ... 共 {len(remaining)} 个，仅显示前 5")
 
-        print(line + "\n")
-
-    # ── 模型参数常驻显存估算（Fix 7）────────────────────────────────────────
+        print(line)
 
     def estimate_parameter_memory(self, model: nn.Module) -> Dict:
         """
@@ -360,17 +252,6 @@ class MemoryAnalyzer:
         参数和缓冲区在整个训练过程中始终占据显存，重计算无法改变这部分。
         结果会缓存到 self._param_memory，供 save_report() 写入 JSON。
         调用后直接打印报告并返回结果字典。
-
-        Returns
-        -------
-        {
-            'param_bytes':    int,   所有可训练参数的字节数
-            'buffer_bytes':   int,   所有缓冲区的字节数
-            'total_bytes':    int,   两者之和
-            'num_params':     int,   参数张量数量
-            'num_buffers':    int,   缓冲区张量数量
-            'num_elements':   int,   总参数量（元素数）
-        }
         """
         param_bytes  = 0
         buffer_bytes = 0
@@ -397,17 +278,18 @@ class MemoryAnalyzer:
         }
         self._param_memory = result  # 缓存供 save_report() 使用
 
-        line = "─" * 64
+        line = "─" * 68
         print(f"\n{line}")
-        print("  [模型参数常驻显存]  参数与缓冲区在训练全程占据，重计算无法节省")
+        print("  模型参数常驻显存（参数与缓冲区在训练全程占据，重计算无法节省）")
         print(line)
-        print(f"  可训练参数: {num_params:>6} 个张量  {num_elements:>12,} 元素  "
-              f"{_fmt_bytes(param_bytes):>12}")
-        print(f"  缓冲区:     {num_buffers:>6} 个张量                    "
-              f"{_fmt_bytes(buffer_bytes):>12}")
-        print(f"  合计:                                              "
+        print(f"  {'类型':<14} {'张量数':>8} {'元素数':>14} {'内存':>12}")
+        print(f"  {'─'*14} {'─'*8} {'─'*14} {'─'*12}")
+        print(f"  {'可训练参数':<14} {num_params:>8} {num_elements:>14,} {_fmt_bytes(param_bytes):>12}")
+        print(f"  {'缓冲区':<14} {num_buffers:>8} {'':>14} {_fmt_bytes(buffer_bytes):>12}")
+        print(f"  {'─'*14} {'─'*8} {'─'*14} {'─'*12}")
+        print(f"  {'合计':<14} {num_params + num_buffers:>8} {num_elements:>14,} "
               f"{_fmt_bytes(param_bytes + buffer_bytes):>12}")
-        print(line + "\n")
+        print(line)
 
         return result
 
@@ -416,85 +298,167 @@ class MemoryAnalyzer:
     def profile_step(
         self,
         tag: str,
-        fn: Callable,
-        warmup: int = 2,
-        steps: int = 5,
+        fn: Optional[Callable] = None,
+        *,
+        forward_fn: Optional[Callable] = None,
+        optimizer: Optional["torch.optim.Optimizer"] = None,
+        warmup: int = 5,
+        steps: int = 10,
     ) -> Dict:
         """
-        运行 fn() 若干次，统计每步峰值显存与耗时。
+        运行训练步骤若干次，统计每步峰值显存与耗时。
+
+        支持两种模式：
+
+        **传统模式** — 传入 ``fn``（向后兼容）::
+
+            profile_step("baseline", fn=step_fn)
+
+        **分阶段模式** — 传入 ``forward_fn`` + ``optimizer``（推荐）::
+
+            profile_step("recomputed",
+                         forward_fn=lambda: criterion(model(x), y),
+                         optimizer=opt)
+
+        分阶段模式下，profiler 会自动分别计时前向、反向、优化器三阶段，
+        并单独记录首次 warmup 调用的编译耗时。
 
         Parameters
         ----------
-        tag    : 标识符，用于报告中区分配置（如 "baseline" / "recomputed"）。
-        fn     : 无参可调用对象，封装一个完整训练步骤（forward + backward + optimizer.step）。
-        warmup : 预热次数，不纳入统计（让 CUDA graph / JIT 编译稳定）。
-        steps  : 正式采样次数。
-
-        Returns
-        -------
-        {
-            'tag': str,
-            'device': str,
-            'peak_memory_bytes': list[int],   每步峰值显存（CUDA）或 RSS 字节（CPU + psutil）
-            'elapsed_ms': list[float],         每步耗时（ms）
-            'avg_peak_bytes': float,           -1.0 表示无法测量（CPU 且无 psutil）
-            'max_peak_bytes': float,
-            'min_peak_bytes': float,
-            'avg_elapsed_ms': float,
-            'max_elapsed_ms': float,
-            'min_elapsed_ms': float,
-        }
+        tag        : 标识符，用于报告中区分配置。
+        fn         : 传统模式 — 无参可调用对象，封装完整训练步骤。
+        forward_fn : 分阶段模式 — 返回 loss tensor 的可调用对象。
+        optimizer  : 分阶段模式 — torch.optim.Optimizer 实例。
+        warmup     : 预热次数（默认 5，让编译/autotuning 稳定）。
+        steps      : 正式采样次数。
         """
+        # ── 参数校验 ──
+        is_phased = forward_fn is not None
+        if fn is not None and is_phased:
+            raise ValueError("fn 与 forward_fn 互斥，请只传其中一个。")
+        if fn is None and not is_phased:
+            raise ValueError("请传入 fn 或 forward_fn。")
+        if is_phased and optimizer is None:
+            raise ValueError("分阶段模式下必须传入 optimizer。")
+
         is_cuda = self.device.startswith('cuda') and torch.cuda.is_available()
 
-        # Fix 2: CPU 端借助 psutil 读取 RSS（驻留集大小）
+        # CPU 端借助 psutil 读取 RSS（驻留集大小）
         proc = None
         if not is_cuda and _PSUTIL_AVAILABLE:
             proc = psutil.Process(os.getpid())
 
-        print(f"[MemoryAnalyzer] 预热 '{tag}' ({warmup} 步)...")
-        for _ in range(warmup):
-            fn()
-        if is_cuda:
-            torch.cuda.synchronize(self.device)
+        def _sync():
+            if is_cuda:
+                torch.cuda.synchronize(self.device)
 
-        print(f"[MemoryAnalyzer] 正式采样 '{tag}' ({steps} 步)...")
+        # ── Warmup（首步计时 → compile_ms）──
+        print(f"  [{tag}] 预热 {warmup} 步...")
+        compile_ms = 0.0
+
+        for w in range(warmup):
+            _sync()
+            if w == 0:
+                t_compile = time.perf_counter()
+
+            if is_phased:
+                optimizer.zero_grad()
+                loss = forward_fn()
+                loss.backward()
+                optimizer.step()
+            else:
+                fn()
+
+            _sync()
+            if w == 0:
+                compile_ms = (time.perf_counter() - t_compile) * 1000
+
+        # ── 采样 ──
+        print(f"  [{tag}] 采样 {steps} 步...")
         peak_mem_list: List[int]   = []
         elapsed_list:  List[float] = []
+        forward_list:  List[float] = []
+        backward_list: List[float] = []
+        optim_list:    List[float] = []
 
         for i in range(steps):
             if is_cuda:
                 torch.cuda.reset_peak_memory_stats(self.device)
-                torch.cuda.synchronize(self.device)
-            elif proc is not None:
-                # 采样前先读一次 RSS 作为基准（实际峰值在 fn 执行中产生，此处取执行后值作近似）
-                pass
 
-            t0 = time.perf_counter()
-            fn()
-            if is_cuda:
-                torch.cuda.synchronize(self.device)
-            elapsed_list.append((time.perf_counter() - t0) * 1000)
+            if is_phased:
+                # ── 分阶段计时 ──
+                optimizer.zero_grad()
 
+                if is_cuda:
+                    # CUDA Event 计时：直接在 GPU 端测量，避免 CPU 调度抖动
+                    ev0 = torch.cuda.Event(enable_timing=True)
+                    ev1 = torch.cuda.Event(enable_timing=True)
+                    ev2 = torch.cuda.Event(enable_timing=True)
+                    ev3 = torch.cuda.Event(enable_timing=True)
+
+                    ev0.record()
+                    loss = forward_fn()
+                    ev1.record()
+                    loss.backward()
+                    ev2.record()
+                    optimizer.step()
+                    ev3.record()
+                    torch.cuda.synchronize()
+
+                    fw_ms  = ev0.elapsed_time(ev1)
+                    bw_ms  = ev1.elapsed_time(ev2)
+                    opt_ms = ev2.elapsed_time(ev3)
+                else:
+                    # CPU 回退：perf_counter
+                    t_fw = time.perf_counter()
+                    loss = forward_fn()
+                    fw_ms = (time.perf_counter() - t_fw) * 1000
+
+                    t_bw = time.perf_counter()
+                    loss.backward()
+                    bw_ms = (time.perf_counter() - t_bw) * 1000
+
+                    t_opt = time.perf_counter()
+                    optimizer.step()
+                    opt_ms = (time.perf_counter() - t_opt) * 1000
+
+                forward_list.append(fw_ms)
+                backward_list.append(bw_ms)
+                optim_list.append(opt_ms)
+                elapsed_list.append(fw_ms + bw_ms + opt_ms)
+            else:
+                # ── 传统整体计时 ──
+                if is_cuda:
+                    ev_start = torch.cuda.Event(enable_timing=True)
+                    ev_end   = torch.cuda.Event(enable_timing=True)
+                    ev_start.record()
+                    fn()
+                    ev_end.record()
+                    torch.cuda.synchronize()
+                    elapsed_list.append(ev_start.elapsed_time(ev_end))
+                else:
+                    t0 = time.perf_counter()
+                    fn()
+                    elapsed_list.append((time.perf_counter() - t0) * 1000)
+
+            # 峰值显存采集
             if is_cuda:
                 peak_mem_list.append(torch.cuda.max_memory_allocated(self.device))
             elif proc is not None:
                 peak_mem_list.append(proc.memory_info().rss)
 
-            # Fix 3: 改用 % 延迟格式，避免 debug 级别下多余的字符串拼接
             peak_str = _fmt_bytes(peak_mem_list[-1]) if peak_mem_list else "N/A"
             logger.debug(
-                "[MemoryAnalyzer] '%s' step %d/%d: peak=%s, time=%.1f ms",
+                "[MemoryProfiler] '%s' step %d/%d: peak=%s, time=%.1f ms",
                 tag, i + 1, steps, peak_str, elapsed_list[-1],
             )
 
-        # Fix 6: 计算 min / max
+        # ── 统计汇总 ──
         if peak_mem_list:
             avg_peak = sum(peak_mem_list) / len(peak_mem_list)
             max_peak = float(max(peak_mem_list))
             min_peak = float(min(peak_mem_list))
         else:
-            # CPU 且无 psutil：用 -1.0 表示无法测量
             avg_peak = -1.0
             max_peak = -1.0
             min_peak = -1.0
@@ -502,6 +466,7 @@ class MemoryAnalyzer:
         avg_time = sum(elapsed_list) / len(elapsed_list)
         max_time = max(elapsed_list)
         min_time = min(elapsed_list)
+        iqr_time = _iqr_mean(elapsed_list)
 
         result = {
             'tag': tag,
@@ -514,82 +479,140 @@ class MemoryAnalyzer:
             'avg_elapsed_ms': avg_time,
             'max_elapsed_ms': max_time,
             'min_elapsed_ms': min_time,
+            'median_elapsed_ms': _median(elapsed_list),
+            'iqr_elapsed_ms': iqr_time,
+            'compile_ms': compile_ms,
         }
+
+        # ── 分阶段字段（仅 phased 模式）──
+        if is_phased:
+            result['forward_ms']  = forward_list
+            result['backward_ms'] = backward_list
+            result['optimizer_ms'] = optim_list
+            result['avg_forward_ms']  = sum(forward_list) / len(forward_list)
+            result['avg_backward_ms'] = sum(backward_list) / len(backward_list)
+            result['avg_optimizer_ms'] = sum(optim_list) / len(optim_list)
+            result['median_forward_ms']  = _median(forward_list)
+            result['median_backward_ms'] = _median(backward_list)
+            result['median_optimizer_ms'] = _median(optim_list)
+            result['iqr_forward_ms']  = _iqr_mean(forward_list)
+            result['iqr_backward_ms'] = _iqr_mean(backward_list)
+            result['iqr_optimizer_ms'] = _iqr_mean(optim_list)
+
         self._runtime_results[tag] = result
 
-        # Fix 2: CPU 无显存数据时显示 N/A
+        # ── 打印摘要 ──
         if avg_peak >= 0:
-            peak_str = f"avg {_fmt_bytes(avg_peak)} [min {_fmt_bytes(min_peak)} / max {_fmt_bytes(max_peak)}]"
+            peak_str = f"平均 {_fmt_bytes(avg_peak)} [最小 {_fmt_bytes(min_peak)} / 最大 {_fmt_bytes(max_peak)}]"
         else:
-            peak_str = "N/A (CPU，请安装 psutil 以测量 RSS)" if not _PSUTIL_AVAILABLE else "N/A"
+            peak_str = "N/A（CPU 环境，请安装 psutil 以测量 RSS）" if not _PSUTIL_AVAILABLE else "N/A"
 
-        print(
-            f"[MemoryAnalyzer] '{tag}': {peak_str}, "
-            f"avg time {avg_time:.1f} ms [min {min_time:.1f} / max {max_time:.1f}]\n"
-        )
+        summary = f"  [{tag}] 峰值显存: {peak_str}, IQR步时: {iqr_time:.1f} ms"
+        if is_phased:
+            summary += (
+                f" (FW {result['iqr_forward_ms']:.1f}"
+                f" / BW {result['iqr_backward_ms']:.1f}"
+                f" / Opt {result['iqr_optimizer_ms']:.1f})"
+            )
+        if compile_ms > 0:
+            summary += f", 编译: {compile_ms:.0f} ms"
+        print(summary)
+
         return result
 
     # ── 综合报告 ──────────────────────────────────────────────────────────────
 
     def report(self) -> None:
         """打印静态估算结果（若有且未打印过）和所有运行时配置的对比报告。"""
-        # Fix 1: 仅在 estimate() 未打印过时才打印静态报告
+        # 仅在 estimate() 未打印过时才打印静态报告
         if self._static_result and not self._static_reported:
             self._print_static_report(self._static_result)
 
         if not self._runtime_results:
             return
 
-        line = "─" * 64
+        line = "─" * 100
         print(f"\n{line}")
-        print("  [运行时内存 & 耗时对比]")
+        print("  运行时内存 & 耗时对比")
         print(line)
 
-        # Fix 6: 汇总表增加 min/max 列
-        has_mem = any(r['avg_peak_bytes'] >= 0 for r in self._runtime_results.values())
-        if has_mem:
-            print(f"  {'配置':<20} {'平均峰值显存':>14} {'最小':>10} {'最大':>10} {'平均耗时':>12}")
-            print(f"  {'─'*20} {'─'*14} {'─'*10} {'─'*10} {'─'*12}")
-        else:
-            print(f"  {'配置':<20} {'峰值显存':>14} {'平均耗时':>12}")
-            print(f"  {'─'*20} {'─'*14} {'─'*12}")
+        has_mem   = any(r['avg_peak_bytes'] >= 0 for r in self._runtime_results.values())
+        has_phase = any('forward_ms' in r for r in self._runtime_results.values())
 
+        # ── 表头 ──
+        hdr  = f"  {'配置':<22}"
+        sep  = f"  {'─'*22}"
+        if has_mem:
+            hdr += f" {'峰值显存':>12}"
+            sep += f" {'─'*12}"
+        hdr += f" {'编译耗时':>10} {'IQR步时':>10}"
+        sep += f" {'─'*10} {'─'*10}"
+        if has_phase:
+            hdr += f" {'前向':>9} {'反向':>9} {'优化器':>9}"
+            sep += f" {'─'*9} {'─'*9} {'─'*9}"
+        print(hdr)
+        print(sep)
+
+        # ── 数据行 ──
         tags = list(self._runtime_results.keys())
         for tag, r in self._runtime_results.items():
-            if has_mem and r['avg_peak_bytes'] >= 0:
-                print(
-                    f"  {tag:<20} {_fmt_bytes(r['avg_peak_bytes']):>14} "
-                    f"{_fmt_bytes(r['min_peak_bytes']):>10} "
-                    f"{_fmt_bytes(r['max_peak_bytes']):>10} "
-                    f"{r['avg_elapsed_ms']:>10.1f} ms"
-                )
-            elif has_mem:
-                print(f"  {tag:<20} {'N/A':>14} {'N/A':>10} {'N/A':>10} {r['avg_elapsed_ms']:>10.1f} ms")
-            else:
-                print(f"  {tag:<20} {'N/A':>14} {r['avg_elapsed_ms']:>10.1f} ms")
+            row = f"  {tag:<22}"
+            if has_mem:
+                if r['avg_peak_bytes'] >= 0:
+                    row += f" {_fmt_bytes(r['avg_peak_bytes']):>12}"
+                else:
+                    row += f" {'N/A':>12}"
+            compile_str = f"{r['compile_ms']:.0f} ms" if r.get('compile_ms', 0) > 0 else "N/A"
+            row += f" {compile_str:>10} {r['iqr_elapsed_ms']:>8.1f} ms"
+            if has_phase:
+                if 'forward_ms' in r:
+                    row += (f" {r['iqr_forward_ms']:>7.1f} ms"
+                            f" {r['iqr_backward_ms']:>7.1f} ms"
+                            f" {r['iqr_optimizer_ms']:>7.1f} ms")
+                else:
+                    row += f" {'-':>9} {'-':>9} {'-':>9}"
+            print(row)
 
-        # Fix 5 & 8: 对比区，支持多 tag（均与第一个 tag 作为基准对比）
+        # ── 对比区 ──
         if len(tags) >= 2:
-            print(f"  {'─'*62}")
+            print(f"  {'─'*98}")
             r_base = self._runtime_results[tags[0]]
             for cmp_tag in tags[1:]:
                 r_cmp = self._runtime_results[cmp_tag]
 
-                # 时间对比
-                time_delta = r_cmp['avg_elapsed_ms'] - r_base['avg_elapsed_ms']
-                time_pct   = (time_delta / r_base['avg_elapsed_ms'] * 100
-                              if r_base['avg_elapsed_ms'] > 0 else 0.0)
-                time_dir   = "slower↑" if time_delta > 0 else "faster↓"
+                # 时间对比（基于 IQR 修剪均值）
+                time_delta = r_cmp['iqr_elapsed_ms'] - r_base['iqr_elapsed_ms']
+                time_pct   = (time_delta / r_base['iqr_elapsed_ms'] * 100
+                              if r_base['iqr_elapsed_ms'] > 0 else 0.0)
+                time_dir   = "更慢 ↑" if time_delta > 0 else "更快 ↓"
 
                 print(f"  [{tags[0]} → {cmp_tag}]")
+
+                # 显存对比
+                mem_saved_bytes = 0.0
                 if has_mem and r_base['avg_peak_bytes'] >= 0 and r_cmp['avg_peak_bytes'] >= 0:
                     mem_delta = r_base['avg_peak_bytes'] - r_cmp['avg_peak_bytes']
-                    mem_dir   = "saved" if mem_delta >= 0 else "increased"
-                    print(f"    Peak memory {mem_dir}: {_fmt_bytes(abs(mem_delta))}")
-                # Fix 5: 时间开销显示百分比
-                print(f"    时间开销: {time_delta:+.1f} ms  ({time_pct:+.1f}%)  {time_dir}")
+                    mem_saved_bytes = mem_delta
+                    mem_dir = "节省" if mem_delta >= 0 else "增加"
+                    print(f"    峰值显存{mem_dir}: {_fmt_bytes(abs(mem_delta))}")
 
-        print(line + "\n")
+                print(f"    耗时变化: {time_delta:+.1f} ms ({time_pct:+.1f}%) {time_dir}")
+
+                # 反向阶段对比
+                if 'forward_ms' in r_base and 'forward_ms' in r_cmp:
+                    bw_delta = r_cmp['iqr_backward_ms'] - r_base['iqr_backward_ms']
+                    if abs(bw_delta) > 0.1:
+                        bw_dir = "更慢 ↑" if bw_delta > 0 else "更快 ↓"
+                        print(f"    反向阶段: {bw_delta:+.1f} ms {bw_dir}")
+
+                # 显存-时间权衡
+                if mem_saved_bytes > 0 and time_delta > 0:
+                    ratio = (mem_saved_bytes / (1 << 20)) / time_delta
+                    print(f"    显存-时间权衡: 每多花 1ms 可节省 {ratio:.1f} MB 显存")
+                elif mem_saved_bytes > 0 and time_delta <= 0:
+                    print(f"    显存-时间权衡: 节省 {_fmt_bytes(mem_saved_bytes)} 且无时间开销")
+
+        print(line)
 
     # ── 可视化 ────────────────────────────────────────────────────────────────
 
@@ -598,23 +621,12 @@ class MemoryAnalyzer:
         save_dir: Optional[str] = None,
         show: bool = False,
     ) -> Optional[str]:
-        """
-        生成静态激活内存对比条形图（Pass 前 vs Pass 后）。
-
-        Parameters
-        ----------
-        save_dir : 图片保存目录；为 None 时不保存文件（配合 show=True 使用）。
-        show     : 是否调用 plt.show() 弹出窗口（服务器环境建议保持 False）。
-
-        Returns
-        -------
-        保存的图片路径，未保存时返回 None。
-        """
+        """生成静态激活内存对比条形图（Pass 前 vs Pass 后）。"""
         if not _MPL_AVAILABLE:
-            logger.warning("[MemoryAnalyzer] matplotlib 未安装，跳过静态内存图。")
+            logger.warning("[MemoryProfiler] matplotlib 未安装，跳过静态内存图。")
             return None
         if not self._static_result:
-            logger.warning("[MemoryAnalyzer] 尚未调用 estimate()，无静态数据可绘图。")
+            logger.warning("[MemoryProfiler] 尚未调用 estimate()，无静态数据可绘图。")
             return None
 
         r = self._static_result
@@ -665,7 +677,7 @@ class MemoryAnalyzer:
         if save_dir:
             path = os.path.join(save_dir, 'static_memory.png')
             fig.savefig(path, dpi=150, bbox_inches='tight')
-            logger.info("[MemoryAnalyzer] 静态内存图已保存至: %s", path)
+            logger.info("[MemoryProfiler] 静态内存图已保存至: %s", path)
         if show:
             plt.show()
         plt.close(fig)
@@ -676,23 +688,12 @@ class MemoryAnalyzer:
         save_dir: Optional[str] = None,
         show: bool = False,
     ) -> Optional[str]:
-        """
-        生成运行时峰值显存折线图（上）与步骤耗时折线图（下）。
-
-        Parameters
-        ----------
-        save_dir : 图片保存目录；为 None 时不保存文件。
-        show     : 是否调用 plt.show()。
-
-        Returns
-        -------
-        保存的图片路径，未保存时返回 None。
-        """
+        """生成运行时峰值显存折线图（上）与步骤耗时折线图（下）。"""
         if not _MPL_AVAILABLE:
-            logger.warning("[MemoryAnalyzer] matplotlib 未安装，跳过运行时内存图。")
+            logger.warning("[MemoryProfiler] matplotlib 未安装，跳过运行时内存图。")
             return None
         if not self._runtime_results:
-            logger.warning("[MemoryAnalyzer] 尚未调用 profile_step()，无运行时数据可绘图。")
+            logger.warning("[MemoryProfiler] 尚未调用 profile_step()，无运行时数据可绘图。")
             return None
 
         has_mem = any(r['avg_peak_bytes'] >= 0 for r in self._runtime_results.values())
@@ -730,7 +731,8 @@ class MemoryAnalyzer:
             color  = colors[idx % len(colors)]
             ax_time.plot(steps, r['elapsed_ms'], marker='s', label=tag,
                          color=color, linewidth=1.8)
-            ax_time.axhline(r['avg_elapsed_ms'], linestyle='--',
+            median_val = r.get('median_elapsed_ms', r['avg_elapsed_ms'])
+            ax_time.axhline(median_val, linestyle='--',
                             color=color, alpha=0.45, linewidth=1)
         ax_time.set_xlabel('Step')
         ax_time.set_ylabel('Elapsed (ms)')
@@ -745,7 +747,63 @@ class MemoryAnalyzer:
         if save_dir:
             path = os.path.join(save_dir, 'runtime_memory.png')
             fig.savefig(path, dpi=150, bbox_inches='tight')
-            logger.info("[MemoryAnalyzer] 运行时内存图已保存至: %s", path)
+            logger.info("[MemoryProfiler] 运行时内存图已保存至: %s", path)
+        if show:
+            plt.show()
+        plt.close(fig)
+        return path
+
+    def plot_phase_breakdown(
+        self,
+        save_dir: Optional[str] = None,
+        show: bool = False,
+    ) -> Optional[str]:
+        """生成前向/反向/优化器中位耗时分组柱状图（仅含分阶段数据的 tag）。"""
+        if not _MPL_AVAILABLE:
+            logger.warning("[MemoryProfiler] matplotlib 未安装，跳过分阶段柱状图。")
+            return None
+
+        # 筛选有分阶段数据的 tag
+        phased = {tag: r for tag, r in self._runtime_results.items() if 'forward_ms' in r}
+        if not phased:
+            logger.debug("[MemoryProfiler] 无分阶段数据，跳过 phase_breakdown 图。")
+            return None
+
+        tags = list(phased.keys())
+        fw_vals  = [phased[t]['median_forward_ms']  for t in tags]
+        bw_vals  = [phased[t]['median_backward_ms']  for t in tags]
+        opt_vals = [phased[t]['median_optimizer_ms'] for t in tags]
+
+        import numpy as np
+        x = np.arange(len(tags))
+        width = 0.22
+
+        fig, ax = plt.subplots(figsize=(max(8, len(tags) * 2), 5))
+        bars_fw  = ax.bar(x - width, fw_vals,  width, label='Forward',   color='steelblue', alpha=0.85)
+        bars_bw  = ax.bar(x,         bw_vals,  width, label='Backward',  color='coral',     alpha=0.85)
+        bars_opt = ax.bar(x + width, opt_vals, width, label='Optimizer', color='seagreen',  alpha=0.85)
+
+        # 数值标注
+        for bars in (bars_fw, bars_bw, bars_opt):
+            for bar in bars:
+                h = bar.get_height()
+                if h > 0:
+                    ax.text(bar.get_x() + bar.get_width() / 2, h + 0.5,
+                            f'{h:.1f}', ha='center', va='bottom', fontsize=8)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(tags, rotation=15, ha='right')
+        ax.set_ylabel('Median Time (ms)')
+        ax.set_title('Phase Breakdown: Forward / Backward / Optimizer')
+        ax.legend()
+        ax.grid(axis='y', linestyle=':', alpha=0.5)
+        plt.tight_layout()
+
+        path = None
+        if save_dir:
+            path = os.path.join(save_dir, 'phase_breakdown.png')
+            fig.savefig(path, dpi=150, bbox_inches='tight')
+            logger.info("[MemoryProfiler] 分阶段柱状图已保存至: %s", path)
         if show:
             plt.show()
         plt.close(fig)
@@ -759,18 +817,8 @@ class MemoryAnalyzer:
         subfolder: str = "memory",
         save_plots: bool = True,
     ) -> str:
-        """
-        将分析结果以 JSON 格式保存到 IR_artifacts 目录，并可选生成内存图。
-
-        Parameters
-        ----------
-        save_plots : 是否同时生成并保存 static_memory.png / runtime_memory.png（默认 True）。
-
-        Returns
-        -------
-        JSON 报告的保存路径字符串。
-        """
-        from .save_ir import _default_ir_dir  # 延迟导入，避免循环依赖
+        """将分析结果以 JSON 格式保存到 IR_artifacts 目录，并可选生成内存图。"""
+        from ..utils.save_ir import _default_ir_dir  # 延迟导入，避免循环依赖
 
         out_dir = _default_ir_dir(
             model_name or os.getenv("MODEL_NAME", "default_model"),
@@ -780,7 +828,7 @@ class MemoryAnalyzer:
 
         payload: Dict = {}
 
-        # Fix 4: 静态报告增加 remaining_activations 和 primal_details
+        # 静态报告增加 remaining_activations 和 primal_details
         if self._static_result:
             r = self._static_result
             after_act_names = {d['name'] for d in r['after']['activation_details']}
@@ -801,7 +849,7 @@ class MemoryAnalyzer:
                     d for d in r['before']['activation_details']
                     if d['name'] not in after_act_names
                 ],
-                'remaining_activations':   r['after']['activation_details'],  # Fix 4
+                'remaining_activations':   r['after']['activation_details'],
             }
 
         if self._param_memory:
@@ -811,49 +859,76 @@ class MemoryAnalyzer:
             }
 
         if self._runtime_results:
-            payload['runtime'] = {
-                tag: {
-                    'avg_peak_bytes':   r['avg_peak_bytes'],
-                    'max_peak_bytes':   r['max_peak_bytes'],   # Fix 6
-                    'min_peak_bytes':   r['min_peak_bytes'],   # Fix 6
-                    'avg_elapsed_ms':   r['avg_elapsed_ms'],
-                    'max_elapsed_ms':   r['max_elapsed_ms'],   # Fix 6
-                    'min_elapsed_ms':   r['min_elapsed_ms'],   # Fix 6
+            runtime_payload = {}
+            for tag, r in self._runtime_results.items():
+                entry = {
+                    'avg_peak_bytes':    r['avg_peak_bytes'],
+                    'max_peak_bytes':    r['max_peak_bytes'],
+                    'min_peak_bytes':    r['min_peak_bytes'],
+                    'avg_elapsed_ms':    r['avg_elapsed_ms'],
+                    'max_elapsed_ms':    r['max_elapsed_ms'],
+                    'min_elapsed_ms':    r['min_elapsed_ms'],
+                    'median_elapsed_ms': r['median_elapsed_ms'],
+                    'iqr_elapsed_ms':    r['iqr_elapsed_ms'],
+                    'compile_ms':        r['compile_ms'],
                     'peak_memory_bytes': r['peak_memory_bytes'],
                     'elapsed_ms':        r['elapsed_ms'],
                     'device':            r['device'],
                 }
-                for tag, r in self._runtime_results.items()
-            }
-            # Fix 5 & 8: 写入与基准的对比数据
+                # 分阶段字段（仅 phased 模式产生）
+                if 'forward_ms' in r:
+                    entry.update({
+                        'forward_ms':          r['forward_ms'],
+                        'backward_ms':         r['backward_ms'],
+                        'optimizer_ms':        r['optimizer_ms'],
+                        'median_forward_ms':   r['median_forward_ms'],
+                        'median_backward_ms':  r['median_backward_ms'],
+                        'median_optimizer_ms': r['median_optimizer_ms'],
+                        'iqr_forward_ms':      r['iqr_forward_ms'],
+                        'iqr_backward_ms':     r['iqr_backward_ms'],
+                        'iqr_optimizer_ms':    r['iqr_optimizer_ms'],
+                    })
+                runtime_payload[tag] = entry
+            payload['runtime'] = runtime_payload
+
+            # 写入与基准的对比数据
             tags = list(self._runtime_results.keys())
             if len(tags) >= 2:
                 r_base = self._runtime_results[tags[0]]
                 comparisons = []
                 for cmp_tag in tags[1:]:
                     r_cmp = self._runtime_results[cmp_tag]
-                    time_delta = r_cmp['avg_elapsed_ms'] - r_base['avg_elapsed_ms']
-                    time_pct   = (time_delta / r_base['avg_elapsed_ms'] * 100
-                                  if r_base['avg_elapsed_ms'] > 0 else 0.0)
+                    iqr_delta = r_cmp['iqr_elapsed_ms'] - r_base['iqr_elapsed_ms']
+                    iqr_pct   = (iqr_delta / r_base['iqr_elapsed_ms'] * 100
+                                 if r_base['iqr_elapsed_ms'] > 0 else 0.0)
                     entry: Dict = {
                         'baseline': tags[0],
                         'compared': cmp_tag,
-                        'time_delta_ms': time_delta,
-                        'time_delta_pct': time_pct,
+                        'iqr_time_delta_ms': iqr_delta,
+                        'iqr_time_delta_pct': iqr_pct,
                     }
                     if r_base['avg_peak_bytes'] >= 0 and r_cmp['avg_peak_bytes'] >= 0:
                         mem_delta = r_base['avg_peak_bytes'] - r_cmp['avg_peak_bytes']
                         entry['mem_saved_bytes'] = mem_delta
+                        if iqr_delta > 0 and mem_delta > 0:
+                            entry['trade_off_mb_per_ms'] = (
+                                mem_delta / (1 << 20)
+                            ) / iqr_delta
                     comparisons.append(entry)
                 payload['runtime_comparisons'] = comparisons
 
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
 
-        logger.info("[MemoryAnalyzer] 内存报告已保存至: %s", path)
+        logger.info("[MemoryProfiler] 内存报告已保存至: %s", path)
 
         if save_plots:
             self.plot_static_memory(save_dir=out_dir)
             self.plot_runtime_memory(save_dir=out_dir)
+            self.plot_phase_breakdown(save_dir=out_dir)
 
         return path
+
+
+# 向后兼容别名
+MemoryAnalyzer = MemoryProfiler

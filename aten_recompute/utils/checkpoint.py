@@ -1,12 +1,12 @@
 """
-checkpoint_wrapper.py
+checkpoint.py
 
 封装 PyTorch 原生 torch.utils.checkpoint，提供模型级别的 activation checkpoint 包装。
 用于与 ATenIR 选择性重计算进行公平的内存/性能对比。
 
 用法::
 
-    from aten_recompute.utils.checkpoint_wrapper import apply_activation_checkpoint
+    from aten_recompute.utils import apply_activation_checkpoint
 
     apply_activation_checkpoint(
         model,
