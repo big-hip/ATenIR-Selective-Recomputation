@@ -21,3 +21,7 @@ Fw_torch_IR.md
 aten_module_FW*.md
 aten_module_BW*.md
 
+# 忽略 multi30k 训练集及压缩包
+examples/transformer/data/
+*.tar.gz
+
