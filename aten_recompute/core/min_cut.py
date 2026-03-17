@@ -388,6 +388,34 @@ def solve_min_cut_recompute(
                     if base_u == base_v:
                         cut_node_names.add(base_u)
 
+    # ── 5b. 确保 getitem 兄弟节点保存一致性 ─────────────────────────
+    # 如果一个 tuple-producing op（如 SDPA attention）的多个 getitem 输出
+    # 被 min-cut 分配了不同的保存/重计算策略（部分保存、部分重计算），
+    # 则 BW 中 saved 和 recomputed 值来自不同执行的父 op，
+    # 对于含内部随机性的 op（如 attention dropout），这导致梯度不一致→爆炸。
+    # 修复：强制所有 getitem 兄弟节点要么全保存，要么全重计算。
+    from collections import defaultdict as _defaultdict
+    parent_to_getitems: Dict[int, List] = _defaultdict(list)
+    for sv in candidates:
+        if sv.op == "call_function" and sv.target is operator.getitem:
+            parent = sv.args[0]
+            parent_to_getitems[id(parent)].append(sv)
+
+    for _pid, siblings in parent_to_getitems.items():
+        if len(siblings) <= 1:
+            continue
+        any_saved = any(sib.name in cut_node_names for sib in siblings)
+        any_recomputed = any(sib.name not in cut_node_names for sib in siblings)
+        if any_saved and any_recomputed:
+            parent_name = siblings[0].args[0].name
+            logger.info(
+                "[min_cut] getitem 一致性修复: 父节点 '%s' 的 %d 个 getitem "
+                "输出存在 saved/recompute 混合，强制全部保存以确保梯度正确性。",
+                parent_name, len(siblings),
+            )
+            for sib in siblings:
+                cut_node_names.add(sib.name)
+
     # ── 6. 确定重计算节点 ────────────────────────────────────────────
     # 不在 cut_node_names 中的候选节点 = 不需要保存 = 可以重计算
     nodes_to_recompute = [sv for sv in candidates if sv.name not in cut_node_names]
@@ -419,6 +447,25 @@ def solve_min_cut_recompute(
             target_bytes / 1e6, cumulative / 1e6,
         )
         nodes_to_recompute = filtered
+
+    # ── 7b. 最终 getitem 兄弟一致性检查 ────────────────────────────
+    # 预算过滤可能重新引入不一致（选择部分 getitem 兄弟），在此做最终修正。
+    recompute_names = {n.name for n in nodes_to_recompute}
+    for _pid, siblings in parent_to_getitems.items():
+        if len(siblings) <= 1:
+            continue
+        sib_recomputed = [sib for sib in siblings if sib.name in recompute_names]
+        sib_saved = [sib for sib in siblings if sib.name not in recompute_names]
+        if sib_recomputed and sib_saved:
+            # 混合状态 → 强制全部保存（保守但安全）
+            for sib in sib_recomputed:
+                recompute_names.discard(sib.name)
+            logger.info(
+                "[min_cut] 预算后一致性修复: 父节点 '%s' 的 getitem "
+                "siblings 恢复为全部保存。",
+                siblings[0].args[0].name,
+            )
+    nodes_to_recompute = [n for n in nodes_to_recompute if n.name in recompute_names]
 
     # 按内存统计
     total_recomp_bytes = sum(_node_memory_bytes(n) for n in nodes_to_recompute)

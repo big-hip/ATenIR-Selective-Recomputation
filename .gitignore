@@ -10,10 +10,12 @@ build/
 dist/
 *.egg-info/
 .claude
+.vscode
 # Logs & generated artifacts
 *.log
 IR_artifacts/
 dist_logs/
+
 
 # Legacy/top-level IR dumps (旧脚本可能仍会生成)
 Fw_torch_Code.md

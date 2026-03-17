@@ -281,19 +281,30 @@ def _cleanup_mark_layer(
     必须在 _extract_fwd_bwd_modules 之前调用。
     """
     graph = joint_module.graph
+    _debug = os.getenv("RECOMPUTE_DEBUG")
 
+    removed_count = 0
     for node in list(graph.nodes):
         if node.op == "call_function" and "mark_layer" in str(node.target):
             replacement = node.args[0]
             # 更新 saved_values 中的引用
+            replaced_sv = 0
             for i, sv in enumerate(saved_values):
                 if sv is node:
                     saved_values[i] = replacement
+                    replaced_sv += 1
             for i, sn in enumerate(saved_sym_nodes):
                 if sn is node:
                     saved_sym_nodes[i] = replacement
+            if _debug:
+                logger.warning(
+                    "[cleanup] 移除 mark_layer '%s' → replacement '%s' "
+                    "(在 saved_values 中替换了 %d 处)",
+                    node.name, replacement.name, replaced_sv,
+                )
             node.replace_all_uses_with(replacement)
             graph.erase_node(node)
+            removed_count += 1
 
     for node in graph.nodes:
         if "layer_Rank" in node.kwargs:
@@ -301,6 +312,32 @@ def _cleanup_mark_layer(
 
     graph.lint()
     joint_module.recompile()
+
+    if _debug:
+        logger.warning("[cleanup] 共移除 %d 个 mark_layer 节点", removed_count)
+
+    # ── 验证：确保 saved_values 中没有悬空引用 ──
+    graph_node_set = set(graph.nodes)
+    dangling = [sv.name for sv in saved_values if sv not in graph_node_set]
+    if dangling:
+        logger.error(
+            "[cleanup] 严重错误: saved_values 中有 %d 个悬空节点: %s",
+            len(dangling), dangling[:10],
+        )
+    # 去重：cleanup 可能导致多个 saved_values 指向同一个 replacement
+    seen = set()
+    deduped = []
+    for sv in saved_values:
+        if id(sv) not in seen:
+            seen.add(id(sv))
+            deduped.append(sv)
+    if len(deduped) != len(saved_values):
+        if _debug:
+            logger.warning(
+                "[cleanup] saved_values 去重: %d → %d",
+                len(saved_values), len(deduped),
+            )
+        saved_values[:] = deduped
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -372,7 +409,24 @@ def selective_recompute_partition(
     D. 清理 mark_layer
     E. 调用 _extract_fwd_bwd_modules 切分图
     F. 返回 (fw_module, bw_module)
+
+    环境变量：
+    - RECOMPUTE_PASSTHROUGH=1 : 跳过自定义逻辑，委托给 PyTorch 默认 partition
+      （用于诊断：若此模式梯度正常，则问题在自定义 partition 逻辑中）
+    - RECOMPUTE_DEBUG=1 : 输出详细的 partition 诊断日志
     """
+    _debug = os.getenv("RECOMPUTE_DEBUG")
+
+    # ── 旁路模式：委托给默认 partition（用于诊断）────────────────────────
+    if os.getenv("RECOMPUTE_PASSTHROUGH"):
+        logger.warning("[partition] PASSTHROUGH 模式：委托给 default_partition")
+        # 仍需调用 Inductor passes（replace_random 等），否则 aten.rand 无法被 Inductor lower
+        _recursive_joint_graph_passes(joint_module)
+        from torch._functorch.partitioners import default_partition
+        return default_partition(
+            joint_module, _joint_inputs, num_fwd_outputs=num_fwd_outputs
+        )
+
     # ── 阶段 0：Inductor 预处理（replace_random、constant folding 等）──────────
     _recursive_joint_graph_passes(joint_module)
 
@@ -429,6 +483,22 @@ def selective_recompute_partition(
     baseline_count = len(saved_values)
     logger.info("[partition] baseline saved_values: %d 个节点", baseline_count)
 
+    if _debug:
+        mark_in_saved = [sv.name for sv in saved_values
+                         if sv.op == "call_function" and "mark_layer" in str(sv.target)]
+        placeholder_in_saved = [sv.name for sv in saved_values if sv.op == "placeholder"]
+        logger.warning(
+            "[debug] 阶段 A 完毕: saved_values=%d, saved_sym_nodes=%d, "
+            "mark_layer_in_saved=%d, placeholder_in_saved=%d, "
+            "forward_nodes=%d, primals=%d, tangents=%d, fwd_seeds=%d",
+            len(saved_values), len(saved_sym_nodes),
+            len(mark_in_saved), len(placeholder_in_saved),
+            len(forward_node_names), len(primal_inputs),
+            len(tangent_inputs), len(fwd_seed_offset_inputs),
+        )
+        if mark_in_saved:
+            logger.warning("[debug]   mark_layer 节点: %s", mark_in_saved[:5])
+
     # ── 阶段 B：层级传播 ──────────────────────────────────────────────────────
     sorted_ranks, node_name_to_rank = _propagate_layer_ranks(
         joint_module, forward_node_names
@@ -484,7 +554,19 @@ def selective_recompute_partition(
         )
 
     # ── 阶段 D：清理 mark_layer ──────────────────────────────────────────────
+    if _debug:
+        pre_cleanup_count = len(saved_values)
+        pre_cleanup_names = [sv.name for sv in saved_values[:10]]
+        logger.warning(
+            "[debug] 阶段 D 开始: saved_values=%d, 前10个=%s",
+            pre_cleanup_count, pre_cleanup_names,
+        )
     _cleanup_mark_layer(joint_module, saved_values, saved_sym_nodes)
+    if _debug:
+        logger.warning(
+            "[debug] 阶段 D 完毕: saved_values=%d (cleanup 前 %d)",
+            len(saved_values), pre_cleanup_count,
+        )
 
     # ── 阶段 E：图切分 ───────────────────────────────────────────────────────
     fw_module, bw_module = _extract_fwd_bwd_modules(

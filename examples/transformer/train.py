@@ -89,8 +89,9 @@ def build_model(src_vocab_size: int, tgt_vocab_size: int) -> Transformer:
     )
 
 
-def save_checkpoint(model, tag: str, src_vocab_size: int, tgt_vocab_size: int):
-    """保存模型权重和配置到 checkpoints/ 目录。"""
+def save_checkpoint(model, tag: str, src_vocab_size: int, tgt_vocab_size: int,
+                    optimizer=None, scheduler=None, epoch: int = None, best_val_loss: float = None):
+    """保存模型权重和可选训练状态（optimizer/scheduler/epoch）。"""
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     ckpt = {
         "model_state_dict": model.state_dict(),
@@ -106,6 +107,24 @@ def save_checkpoint(model, tag: str, src_vocab_size: int, tgt_vocab_size: int):
             "padding_idx": PAD_ID,
         },
     }
+    if optimizer is not None:
+        try:
+            ckpt["optimizer_state_dict"] = optimizer.state_dict()
+        except Exception:
+            pass
+    if scheduler is not None:
+        try:
+            ckpt["scheduler_state_dict"] = scheduler.state_dict()
+        except Exception:
+            pass
+    if epoch is not None:
+        ckpt["epoch"] = int(epoch)
+    if best_val_loss is not None:
+        try:
+            ckpt["best_val_loss"] = float(best_val_loss)
+        except Exception:
+            pass
+
     path = CHECKPOINT_DIR / f"transformer_{tag}.pt"
     torch.save(ckpt, path)
     print(f"  模型已保存: {path} ({path.stat().st_size / 1024 / 1024:.1f} MB)")
