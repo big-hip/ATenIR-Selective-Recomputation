@@ -7,6 +7,7 @@
 #    ./run.sh benchmark            # 策略对比（静态 + 运行时 profiling）
 #    ./run.sh train                # 完整训练对比（Eager vs ATenIR）
 #    ./run.sh capture              # 仅捕获 IR 计算图
+#    ./run.sh capture-compare      # static(meta) 与 runtime 图对照
 #    ./run.sh custom-train         # 单策略自定义训练（无 eager 对比）
 #    ./run.sh translate            # 交互式翻译
 #    ./run.sh all                  # 依次跑 benchmark + train
@@ -134,6 +135,15 @@ run_capture() {
     RECOMPUTE="$RECOMPUTE" MODEL_NAME="$MODEL_NAME" python capture.py
 }
 
+run_capture_compare() {
+    echo ""
+    echo "$BOLD"
+    echo "  [capture-compare] static(meta) 与 runtime 图签名对照"
+    echo "$BOLD"
+    RECOMPUTE="$RECOMPUTE" MODEL_NAME="$MODEL_NAME" \
+        python capture.py --mode static --static-profile fast --compare-runtime
+}
+
 run_custom_train() {
     echo ""
     echo "$BOLD"
@@ -179,21 +189,23 @@ show_menu() {
     echo "    1) benchmark    — 策略对比 (静态估算 + 运行时 profiling)"
     echo "    2) train        — 完整训练 (Eager vs ATenIR, 收敛 + BLEU + 保存模型)"
     echo "    3) capture      — 仅捕获 IR 计算图 (快速查看 FX 图结构)"
-    echo "    4) custom-train — 单策略自定义训练 (无 eager 对比, 直接训练)"
-    echo "    5) translate    — 交互式翻译 (需要先跑过 train)"
-    echo "    6) all          — 依次跑 benchmark + train"
+    echo "    4) capture-compare — static(meta) 与 runtime 图对照"
+    echo "    5) custom-train — 单策略自定义训练 (无 eager 对比, 直接训练)"
+    echo "    6) translate    — 交互式翻译 (需要先跑过 train)"
+    echo "    7) all          — 依次跑 benchmark + train"
     echo "    s) strategy     — 选择重计算策略（当前: $RECOMPUTE）"
     echo "    q) 退出"
     echo ""
     echo "$LINE"
-    read -rp "  请选择 [1-6/s/q]: " choice
+    read -rp "  请选择 [1-7/s/q]: " choice
     case "$choice" in
         1|benchmark)     run_benchmark ;;
         2|train)         run_train ;;
         3|capture)       run_capture ;;
-        4|custom-train)  run_custom_train ;;
-        5|translate)     run_translate ;;
-        6|all)           run_benchmark; run_train ;;
+        4|capture-compare) run_capture_compare ;;
+        5|custom-train)  run_custom_train ;;
+        6|translate)     run_translate ;;
+        7|all)           run_benchmark; run_train ;;
         s|S|strategy)    select_strategy; show_menu ;;
         q|Q|quit)        echo "  再见！"; exit 0 ;;
         *)               echo "  无效选择: $choice"; exit 1 ;;
@@ -205,6 +217,7 @@ case "${1:-}" in
     benchmark)     run_benchmark ;;
     train)         run_train ;;
     capture)       run_capture ;;
+    capture-compare) run_capture_compare ;;
     custom-train)  shift; run_custom_train "$@" ;;
     translate)     shift; run_translate "$@" ;;
     all)           run_benchmark; run_train ;;
@@ -212,7 +225,7 @@ case "${1:-}" in
     "")            show_menu ;;
     *)
         echo "未知命令: $1"
-        echo "用法: ./run.sh [benchmark|train|capture|custom-train|translate|all|--strategy]"
+        echo "用法: ./run.sh [benchmark|train|capture|capture-compare|custom-train|translate|all|--strategy]"
         exit 1
         ;;
 esac

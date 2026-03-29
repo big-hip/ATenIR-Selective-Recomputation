@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Transformer Experiment Config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "env", "run", "tasks"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_name", "recompute", "recompute_log_level"],
+      "properties": {
+        "model_name": { "type": "string", "minLength": 1 },
+        "recompute": { "type": "object", "minProperties": 0 },
+        "recompute_log_level": {
+          "type": "string",
+          "enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        },
+        "project_root": { "type": "string" }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task"],
+      "properties": {
+        "task": {
+          "type": "string",
+          "enum": [
+            "benchmark",
+            "train",
+            "capture",
+            "custom-train",
+            "translate",
+            "zh-en-train",
+            "zh-en-translate"
+          ]
+        }
+      }
+    },
+    "tasks": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["args"],
+        "properties": {
+          "args": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

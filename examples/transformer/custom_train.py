@@ -32,7 +32,18 @@ if PROJECT_ROOT not in sys.path:
 
 from model import Transformer
 from data_utils import build_dataloaders, BOS_ID, EOS_ID, PAD_ID
-from aten_recompute.core import CompilerBackend, inject_layer_tags
+from aten_recompute.core import (
+    CompilerBackend,
+    inject_layer_tags,
+    describe_strategy,
+    parse_strategy_config,
+)
+from train_common import (
+    seed_everything,
+    save_checkpoint_file,
+    train_one_epoch_token_loss,
+    evaluate_token_loss,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  配置
@@ -60,38 +71,10 @@ CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
 _BOLD = "═" * 72
 _LINE = "─" * 72
 
-STRATEGY_NAMES = {
-    "0": "不重计算",
-    "1": "全部重计算",
-    "2": "按节点名称关键字",
-    "3": "按层步长选择",
-    "4": "按比例选择前 N% 层",
-    "5": "按 ATen 算子类型",
-    "6": "自动廉价重计算（链深度）",
-    "7": "min-cut 最优重计算",
-}
-
-
-def _strategy_desc(cfg: dict) -> str:
-    if not cfg:
-        return "策略 0: 不重计算"
-    key, val = next(iter(cfg.items()))
-    name = STRATEGY_NAMES.get(str(key), "未知策略")
-    param = f", 参数: {val}" if val is not None else ""
-    return f"策略 {key}: {name}{param}"
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  工具函数
 # ═══════════════════════════════════════════════════════════════════════════════
-
-def seed_everything(seed: int):
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
 
 def init_weights(model: nn.Module):
     """Xavier 均匀初始化（Transformer 标准做法）。"""
@@ -126,87 +109,32 @@ def build_model(src_vocab_size: int, tgt_vocab_size: int) -> Transformer:
 def save_checkpoint(model, tag: str, src_vocab_size: int, tgt_vocab_size: int,
                     optimizer=None, scheduler=None, epoch: int = None, best_val_loss: float = None):
     """保存模型与可选训练状态（optimizer/scheduler/epoch）。"""
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    ckpt = {
-        "model_state_dict": model.state_dict(),
-        "model_config": {
-            "src_vocab_size": src_vocab_size,
-            "tgt_vocab_size": tgt_vocab_size,
-            "d_model": D_MODEL,
-            "num_heads": NUM_HEADS,
-            "num_layers": NUM_LAYERS,
-            "d_ff": D_FF,
-            "max_seq_length": MAX_SEQ_LENGTH,
-            "dropout": DROPOUT,
-            "padding_idx": PAD_ID,
-        },
-    }
-    if optimizer is not None:
-        try:
-            ckpt["optimizer_state_dict"] = optimizer.state_dict()
-        except Exception:
-            pass
-    if scheduler is not None:
-        try:
-            ckpt["scheduler_state_dict"] = scheduler.state_dict()
-        except Exception:
-            pass
-    if epoch is not None:
-        ckpt["epoch"] = int(epoch)
-    if best_val_loss is not None:
-        try:
-            ckpt["best_val_loss"] = float(best_val_loss)
-        except Exception:
-            pass
-
     path = CHECKPOINT_DIR / f"transformer_{tag}.pt"
-    torch.save(ckpt, path)
-    print(f"  模型已保存: {path} ({path.stat().st_size / 1024 / 1024:.1f} MB)")
+    model_config = {
+        "src_vocab_size": src_vocab_size,
+        "tgt_vocab_size": tgt_vocab_size,
+        "d_model": D_MODEL,
+        "num_heads": NUM_HEADS,
+        "num_layers": NUM_LAYERS,
+        "d_ff": D_FF,
+        "max_seq_length": MAX_SEQ_LENGTH,
+        "dropout": DROPOUT,
+        "padding_idx": PAD_ID,
+    }
+    save_checkpoint_file(
+        path,
+        model,
+        model_config,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epoch=epoch,
+        best_val_loss=best_val_loss,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  训练 & 评估
 # ═══════════════════════════════════════════════════════════════════════════════
-
-def train_one_epoch(model, loader, criterion, optimizer, device, scheduler=None):
-    model.train()
-    total_loss, total_tokens = 0.0, 0
-    for src, tgt in loader:
-        src, tgt = src.to(device), tgt.to(device)
-        optimizer.zero_grad()
-        output = model(src, tgt[:, :-1])
-        loss = criterion(
-            output.contiguous().view(-1, output.size(-1)),
-            tgt[:, 1:].contiguous().view(-1),
-        )
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-        non_pad = (tgt[:, 1:] != PAD_ID).sum().item()
-        total_loss += loss.item() * non_pad
-        total_tokens += non_pad
-    return total_loss / total_tokens
-
-
-@torch.no_grad()
-def evaluate(model, loader, criterion, device):
-    model.eval()
-    total_loss, total_tokens = 0.0, 0
-    for src, tgt in loader:
-        src, tgt = src.to(device), tgt.to(device)
-        output = model(src, tgt[:, :-1])
-        loss = criterion(
-            output.contiguous().view(-1, output.size(-1)),
-            tgt[:, 1:].contiguous().view(-1),
-        )
-        non_pad = (tgt[:, 1:] != PAD_ID).sum().item()
-        total_loss += loss.item() * non_pad
-        total_tokens += non_pad
-    return total_loss / total_tokens
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Greedy 解码 & BLEU
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -321,7 +249,7 @@ def main():
     torch._dynamo.config.cache_size_limit = 64
     # torch.set_float32_matmul_precision("high")
 
-    strategy_config = json.loads(os.getenv("RECOMPUTE", '{"6": 0}'))
+    strategy_config = parse_strategy_config(os.getenv("RECOMPUTE"))
     strat_key = next(iter(strategy_config), "0")
 
     mode_str = "Eager (无编译)" if use_eager else f"ATenIR 编译 (策略 {strat_key})"
@@ -331,7 +259,7 @@ def main():
     print(f"  设备:       {DEVICE}")
     print(f"  训练模式:   {mode_str}")
     if not use_eager:
-        print(f"  重计算策略: {_strategy_desc(strategy_config)}")
+        print(f"  重计算策略: {describe_strategy(strategy_config)}")
     print(f"  模型:       {NUM_LAYERS}L-{D_MODEL}d-{NUM_HEADS}h-{D_FF}ff")
     print(f"  训练:       {NUM_EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR}")
     print(f"  调度:       warmup={WARMUP_STEPS} steps, label_smoothing={LABEL_SMOOTHING}")
@@ -354,7 +282,7 @@ def main():
     print(f"\n[阶段 2/4] 构建模型")
     print(_LINE)
 
-    seed_everything(SEED)
+    seed_everything(SEED, deterministic=True, benchmark=False)
     model = build_model(src_vocab_size, tgt_vocab_size).to(DEVICE)
     init_weights(model)
     param_count = sum(p.numel() for p in model.parameters()) / 1e6
@@ -393,11 +321,22 @@ def main():
     t0 = time.time()
 
     for epoch in range(NUM_EPOCHS):
-        train_loss = train_one_epoch(
+        train_loss = train_one_epoch_token_loss(
             train_model, train_loader, criterion, optimizer, DEVICE,
+            pad_id=PAD_ID,
+            grad_clip=GRAD_CLIP,
             scheduler=scheduler,
+            scaler=None,
+            amp_enabled=False,
         )
-        val_loss = evaluate(train_model, val_loader, criterion, DEVICE)
+        val_loss = evaluate_token_loss(
+            train_model,
+            val_loader,
+            criterion,
+            device=DEVICE,
+            pad_id=PAD_ID,
+            amp_enabled=False,
+        )
         train_losses.append(train_loss)
         val_losses.append(val_loss)
 
@@ -434,7 +373,7 @@ def main():
     results = {
         "mode": "eager" if use_eager else "compiled",
         "strategy": strategy_config if not use_eager else None,
-        "strategy_desc": _strategy_desc(strategy_config) if not use_eager else "eager",
+        "strategy_desc": describe_strategy(strategy_config) if not use_eager else "eager",
         "model_config": {
             "d_model": D_MODEL, "num_heads": NUM_HEADS,
             "num_layers": NUM_LAYERS, "d_ff": D_FF,

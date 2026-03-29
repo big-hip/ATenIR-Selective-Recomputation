@@ -47,7 +47,18 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from model import Transformer
-from aten_recompute.core import CompilerBackend, inject_layer_tags
+from aten_recompute.core import (
+    CompilerBackend,
+    inject_layer_tags,
+    describe_strategy,
+    parse_strategy_config,
+)
+from train_common import (
+    seed_everything,
+    save_checkpoint_file,
+    train_one_epoch_token_loss,
+    evaluate_token_loss,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  配置
@@ -92,34 +103,6 @@ DEFAULT_DATASET_TSV = DATA_DIR / "cmn.txt"
 _BOLD = "═" * 72
 _LINE = "─" * 72
 
-STRATEGY_NAMES = {
-    "0": "不重计算",
-    "1": "全部重计算",
-    "2": "按节点名称关键字",
-    "3": "按层步长选择",
-    "4": "按比例选择前 N% 层",
-    "5": "按 ATen 算子类型",
-    "6": "自动廉价重计算（链深度）",
-    "7": "min-cut 最优重计算",
-}
-
-def _strategy_desc(cfg: dict) -> str:
-    if not cfg:
-        return "策略 0: 不重计算"
-    key, val = next(iter(cfg.items()))
-    name = STRATEGY_NAMES.get(str(key), "未知策略")
-    param = f", 参数: {val}" if val is not None else ""
-    return f"策略 {key}: {name}{param}"
-
-
-def seed_everything(seed: int):
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = torch.cuda.is_available()
-
-
 def init_weights(model: nn.Module):
     for name, parameter in model.named_parameters():
         if parameter.dim() > 1:
@@ -154,44 +137,29 @@ def build_model(src_vocab_size: int, tgt_vocab_size: int) -> Transformer:
 def save_checkpoint(model, tag: str, src_vocab_size: int, tgt_vocab_size: int,
                     optimizer=None, scheduler=None, epoch: int = None, best_val_loss: float = None):
     """保存模型与可选训练状态（optimizer/scheduler/epoch）。"""
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    checkpoint = {
-        "model_state_dict": model.state_dict(),
-        "model_config": {
-            "src_vocab_size": src_vocab_size,
-            "tgt_vocab_size": tgt_vocab_size,
-            "d_model": D_MODEL,
-            "num_heads": NUM_HEADS,
-            "num_layers": NUM_LAYERS,
-            "d_ff": D_FF,
-            "max_seq_length": MAX_SEQ_LENGTH,
-            "dropout": DROPOUT,
-            "padding_idx": PAD_ID,
-            "source_language": "zh",
-            "target_language": "en",
-        },
-    }
-    if optimizer is not None:
-        try:
-            checkpoint["optimizer_state_dict"] = optimizer.state_dict()
-        except Exception:
-            pass
-    if scheduler is not None:
-        try:
-            checkpoint["scheduler_state_dict"] = scheduler.state_dict()
-        except Exception:
-            pass
-    if epoch is not None:
-        checkpoint["epoch"] = int(epoch)
-    if best_val_loss is not None:
-        try:
-            checkpoint["best_val_loss"] = float(best_val_loss)
-        except Exception:
-            pass
-
     path = CHECKPOINT_DIR / f"transformer_zh_en_{tag}.pt"
-    torch.save(checkpoint, path)
-    print(f"  模型已保存: {path} ({path.stat().st_size / 1024 / 1024:.1f} MB)")
+    model_config = {
+        "src_vocab_size": src_vocab_size,
+        "tgt_vocab_size": tgt_vocab_size,
+        "d_model": D_MODEL,
+        "num_heads": NUM_HEADS,
+        "num_layers": NUM_LAYERS,
+        "d_ff": D_FF,
+        "max_seq_length": MAX_SEQ_LENGTH,
+        "dropout": DROPOUT,
+        "padding_idx": PAD_ID,
+        "source_language": "zh",
+        "target_language": "en",
+    }
+    save_checkpoint_file(
+        path,
+        model,
+        model_config,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epoch=epoch,
+        best_val_loss=best_val_loss,
+    )
 
 
 def _read_lines(path: Path) -> List[str]:
@@ -497,60 +465,6 @@ def build_dataloaders(args):
 
     return train_loader, val_loader, test_loader, src_tok, tgt_tok, dataset_name
 
-
-def train_one_epoch(model, loader, criterion, optimizer, scaler, amp_enabled, scheduler=None):
-    model.train()
-    total_loss, total_tokens = 0.0, 0
-    for src, tgt in loader:
-        src = src.to(DEVICE, non_blocking=True)
-        tgt = tgt.to(DEVICE, non_blocking=True)
-        optimizer.zero_grad(set_to_none=True)
-
-        with torch.amp.autocast(device_type=DEVICE.type, enabled=amp_enabled):
-            output = model(src, tgt[:, :-1])
-            loss = criterion(
-                output.contiguous().view(-1, output.size(-1)),
-                tgt[:, 1:].contiguous().view(-1),
-            )
-
-        if amp_enabled:
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
-            optimizer.step()
-
-        if scheduler is not None:
-            scheduler.step()
-        non_pad_tokens = (tgt[:, 1:] != PAD_ID).sum().item()
-        total_loss += loss.item() * non_pad_tokens
-        total_tokens += non_pad_tokens
-    return total_loss / max(total_tokens, 1)
-
-
-@torch.no_grad()
-def evaluate(model, loader, criterion, amp_enabled):
-    model.eval()
-    total_loss, total_tokens = 0.0, 0
-    for src, tgt in loader:
-        src = src.to(DEVICE, non_blocking=True)
-        tgt = tgt.to(DEVICE, non_blocking=True)
-        with torch.amp.autocast(device_type=DEVICE.type, enabled=amp_enabled):
-            output = model(src, tgt[:, :-1])
-            loss = criterion(
-                output.contiguous().view(-1, output.size(-1)),
-                tgt[:, 1:].contiguous().view(-1),
-            )
-        non_pad_tokens = (tgt[:, 1:] != PAD_ID).sum().item()
-        total_loss += loss.item() * non_pad_tokens
-        total_tokens += non_pad_tokens
-    return total_loss / max(total_tokens, 1)
-
-
 @torch.no_grad()
 def greedy_decode(model, src, max_len):
     model.eval()
@@ -705,10 +619,14 @@ def main():
     os.environ.setdefault("RECOMPUTE_LOG_LEVEL", "WARNING")
     torch._dynamo.config.cache_size_limit = 64
     torch.set_float32_matmul_precision("high")
-    seed_everything(args.seed)
+    seed_everything(
+        args.seed,
+        deterministic=False,
+        benchmark=torch.cuda.is_available(),
+    )
     amp_enabled = DEVICE.type == "cuda" and not args.disable_amp
 
-    strategy_config = json.loads(args.strategy or os.getenv("RECOMPUTE", '{"6": 0}'))
+    strategy_config = parse_strategy_config(args.strategy or os.getenv("RECOMPUTE"))
     strategy_key = next(iter(strategy_config), "0")
     use_eager = args.eager
 
@@ -719,7 +637,7 @@ def main():
     print(f"  设备:       {DEVICE}")
     print(f"  训练模式:   {mode_str}")
     if not use_eager:
-        print(f"  重计算策略: {_strategy_desc(strategy_config)}")
+        print(f"  重计算策略: {describe_strategy(strategy_config)}")
     print(f"  模型:       {NUM_LAYERS}L-{D_MODEL}d-{NUM_HEADS}h-{D_FF}ff")
     print(f"  训练:       {args.epochs} epochs, batch={args.batch_size}, lr={LR}")
     print(f"  AMP:        {'on' if amp_enabled else 'off'}")
@@ -826,16 +744,29 @@ def main():
     # 若 checkpoint 中包含 optimizer/scheduler 的状态，则在创建后恢复（下一步）
 
     for epoch in epoch_iter:
-        train_loss = train_one_epoch(
+        train_loss = train_one_epoch_token_loss(
             train_model,
             train_loader,
             criterion,
             optimizer,
-            scaler,
-            amp_enabled,
+            device=DEVICE,
+            pad_id=PAD_ID,
+            grad_clip=GRAD_CLIP,
             scheduler=scheduler,
+            scaler=scaler,
+            amp_enabled=amp_enabled,
+            non_blocking=True,
+            set_to_none=True,
         )
-        val_loss = evaluate(eval_model, val_loader, criterion, amp_enabled)
+        val_loss = evaluate_token_loss(
+            eval_model,
+            val_loader,
+            criterion,
+            device=DEVICE,
+            pad_id=PAD_ID,
+            amp_enabled=amp_enabled,
+            non_blocking=True,
+        )
         train_losses.append(train_loss)
         val_losses.append(val_loss)
 
@@ -878,7 +809,7 @@ def main():
         "dataset": dataset_name,
         "mode": "eager" if use_eager else "compiled",
         "strategy": strategy_config if not use_eager else None,
-        "strategy_desc": _strategy_desc(strategy_config) if not use_eager else "eager",
+        "strategy_desc": describe_strategy(strategy_config) if not use_eager else "eager",
         "model_config": {
             "d_model": D_MODEL,
             "num_heads": NUM_HEADS,

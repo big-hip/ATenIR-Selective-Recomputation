@@ -13,27 +13,6 @@ if PROJECT_ROOT not in sys.path:
 _LINE = "─" * 68
 _BOLD = "═" * 68
 
-STRATEGY_NAMES = {
-    "0": "不重计算",
-    "1": "全部重计算",
-    "2": "按节点名称关键字",
-    "3": "按层步长选择",
-    "4": "按比例选择前 N% 层",
-    "5": "按 ATen 算子类型",
-    "6": "自动廉价重计算（链深度）",
-    "7": "min-cut 最优重计算",
-}
-
-
-def _strategy_desc(cfg: dict) -> str:
-    """返回策略的可读描述，如 '策略 6: 自动廉价重计算（链深度）, 参数: 0'"""
-    if not cfg:
-        return "策略 0: 不重计算"
-    key, val = next(iter(cfg.items()))
-    name = STRATEGY_NAMES.get(str(key), "未知策略")
-    param = f", 参数: {val}" if val is not None else ""
-    return f"策略 {key}: {name}{param}"
-
 
 def main():
     # ──────────────────────────────────────────────────────────────────────────
@@ -41,20 +20,25 @@ def main():
     # ──────────────────────────────────────────────────────────────────────────
     os.environ.setdefault("RECOMPUTE_LOG_LEVEL", "INFO")
 
-    import json
     import torch
     import torch.nn as nn
 
     from model import Transformer, device
-    from aten_recompute.core import CompilerBackend, inject_layer_tags
-    from aten_recompute.analysis import MemoryProfiler, StaticEstimator, print_method_comparison
+    from aten_recompute.core import (
+        CompilerBackend,
+        describe_strategy,
+        parse_strategy_config,
+    )
+    from aten_recompute.analysis import (
+        MemoryProfiler, StaticEstimator, FLOPsEstimator, print_method_comparison,
+    )
     from aten_recompute.utils import apply_activation_checkpoint
+    from meta_pipeline import capture_static_with_retry, inject_transformer_layer_tags
 
     model_name = os.getenv("MODEL_NAME", "Transformer")
 
     # 策略配置：优先从环境变量 RECOMPUTE 读取，否则使用默认策略 6（自动廉价）
-    recompute_env = os.getenv("RECOMPUTE", '{"6": 0}')
-    strategy_config = json.loads(recompute_env)
+    strategy_config = parse_strategy_config(os.getenv("RECOMPUTE"))
 
     # ──────────────────────────────────────────────────────────────────────────
     # 1. 初始化模型与数据
@@ -82,7 +66,7 @@ def main():
     print(_BOLD)
     print(f"  模型:         {model_name} ({num_layers} layers, d_model={d_model})")
     print(f"  设备:         {device}")
-    print(f"  重计算策略:   {_strategy_desc(strategy_config)}")
+    print(f"  重计算策略:   {describe_strategy(strategy_config)}")
     print(f"  批次大小:     {batch_size}")
     print(f"  序列长度:     {max_seq_length}")
     print(f"  训练步数:     {n_steps}")
@@ -93,12 +77,7 @@ def main():
     # mark_layer 在 eager 模式下会调用 x.clone()，污染基准测试的显存和耗时。
     _clean_model = copy.deepcopy(transformer)
 
-    _enc_layers = [(layer, i) for i, layer in enumerate(transformer.encoder_layers)]
-    _dec_layers = [
-        (layer, len(transformer.encoder_layers) + i)
-        for i, layer in enumerate(transformer.decoder_layers)
-    ]
-    _tag_handles = inject_layer_tags(_enc_layers + _dec_layers)
+    inject_transformer_layer_tags(transformer)
 
     src_data = torch.randint(1, src_vocab_size, (batch_size, max_seq_length)).to(device)
     tgt_data = torch.randint(1, tgt_vocab_size, (batch_size, max_seq_length)).to(device)
@@ -109,7 +88,7 @@ def main():
     # ──────────────────────────────────────────────────────────────────────────
     # 2. 编译（partition_fn 内自动完成重计算策略选择 + mark_layer 清理）
     # ──────────────────────────────────────────────────────────────────────────
-    print(f"\n[阶段 1/4] 编译模型")
+    print(f"\n[阶段 1/5] 编译模型")
     print(_LINE)
     backend = CompilerBackend(strategy_config=strategy_config, save_ir=True)
     compiled_transformer = torch.compile(
@@ -119,7 +98,7 @@ def main():
     # ──────────────────────────────────────────────────────────────────────────
     # 3. 训练验证
     # ──────────────────────────────────────────────────────────────────────────
-    print(f"\n[阶段 2/4] 训练验证 ({n_steps} 步)")
+    print(f"\n[阶段 2/5] 训练验证 ({n_steps} 步)")
     print(_LINE)
     optimizer = torch.optim.Adam(
         transformer.parameters(), lr=1e-4, betas=(0.9, 0.98), eps=1e-9
@@ -142,44 +121,106 @@ def main():
     print(f"  训练验证完成")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 4. 静态峰值显存估算（基于 FX 图 FakeTensor 元信息，无需 GPU 运行）
+    # 4. 统一图捕获 + 静态分析（显存 + FLOPs + 时间）
     # ──────────────────────────────────────────────────────────────────────────
-    print(f"\n[阶段 3/4] 静态峰值显存估算")
+    # strategy N 的图复用阶段 1 CompilerBackend 已捕获的 fw_gm/bw_gm；
+    # strategy 0 仅需一次轻量编译（跳过 Inductor）。
+    print(f"\n[阶段 3/5] 静态分析（显存 + FLOPs + 时间）")
     print(_LINE)
 
-    # 构造当前策略的标签名
     _strat_key = next(iter(strategy_config), "0")
     _strat_tag = f"ATenIR_strat{_strat_key}"
 
-    static_estimator = StaticEstimator()
-    static_estimator.compare_strategies(
-        model=transformer,
-        sample_inputs=(src_data, tgt_data[:, :-1]),
-        strategies={
-            "no_recompute":  {"0": None},
-            _strat_tag:      strategy_config,
-            "pytorch_ckpt":  "checkpoint",
-        },
-        module_lists=lambda m: [m.encoder_layers, m.decoder_layers],
-        loss_fn=lambda out: criterion(
-            out.contiguous().view(-1, tgt_vocab_size),
-            tgt_data[:, 1:].contiguous().view(-1),
-        ),
-        optimizer_type="adam",
+    _module_lists_fn = lambda m: [m.encoder_layers, m.decoder_layers]
+    _loss_fn = lambda out: criterion(
+        out.contiguous().view(-1, tgt_vocab_size),
+        tgt_data[:, 1:].contiguous().view(-1),
     )
+
+    # ── 图捕获 ────────────────────────────────────────────────────────────
+    _captured_graphs = {}  # {tag: (fw_gm, bw_gm)}
+
+    # strategy N：复用阶段 1 已编译的 CompilerBackend 捕获的图
+    if backend.fw_gm is not None and backend.bw_gm is not None:
+        _captured_graphs[_strat_tag] = (backend.fw_gm, backend.bw_gm)
+        print(f"  [{_strat_tag}] 复用阶段 1 编译图"
+              f"（FW {len(list(backend.fw_gm.graph.nodes))} 节点"
+              f" / BW {len(list(backend.bw_gm.graph.nodes))} 节点）")
+
+    # strategy 0：轻量编译（跳过 Inductor，仅捕获图）
+    import time as _time
+    _t0 = _time.time()
+
+    _model_copy = copy.deepcopy(transformer)
+    _model_copy.train()
+    inject_transformer_layer_tags(_model_copy)
+    sample_inputs = (src_data, tgt_data[:, :-1])
+    _nr_backend, _nr_use_decomp, _nr_exec_err = capture_static_with_retry(
+        _model_copy,
+        sample_inputs,
+        _loss_fn,
+        strategy_config={"0": None},
+        dynamic=True,
+        use_meta=True,
+    )
+
+    _elapsed = _time.time() - _t0
+    if _nr_backend.fw_gm is not None and _nr_backend.bw_gm is not None:
+        _captured_graphs["no_recompute"] = (_nr_backend.fw_gm, _nr_backend.bw_gm)
+        print(f"  [no_recompute] 轻量编译完成 ({_elapsed:.1f}s)，"
+              f"FW {len(list(_nr_backend.fw_gm.graph.nodes))} 节点"
+              f" / BW {len(list(_nr_backend.bw_gm.graph.nodes))} 节点")
+        print(f"  [no_recompute] decomp 路径: {'on' if _nr_use_decomp else 'off'}")
+        if _nr_exec_err is not None:
+            print(
+                f"  [no_recompute] 执行告警: 捕获成功但执行失败 "
+                f"({type(_nr_exec_err).__name__}: {_nr_exec_err})"
+            )
+    del _model_copy, _nr_backend
+
+    # ── 静态峰值显存估算（复用捕获的图）────────────────────────────────────
+    print(f"\n  ── 静态峰值显存估算 ──")
+    static_estimator = StaticEstimator()
+
+    for _tag, (_fw, _bw) in _captured_graphs.items():
+        static_estimator.estimate_from_graphs(
+            _fw, _bw, transformer, optimizer_type="adam", tag=_tag,
+        )
+
+    # checkpoint 公式推导（需要 no_recompute 作为 baseline，不需要编译）
+    if "no_recompute" in static_estimator._results:
+        static_estimator.compare_strategies(
+            model=transformer,
+            sample_inputs=sample_inputs,
+            strategies={"pytorch_ckpt": "checkpoint"},
+            module_lists=_module_lists_fn,
+            loss_fn=_loss_fn,
+            optimizer_type="adam",
+        )
+
     static_estimator.report()
     static_estimator.save_report(model_name=model_name)
+
+    # ── FLOPs & 执行时间估算（复用捕获的图）──────────────────────────────
+    print(f"\n  ── FLOPs & 执行时间估算 ──")
+    flops_estimator = FLOPsEstimator(device=device)
+
+    for _tag, (_fw, _bw) in _captured_graphs.items():
+        flops_estimator.estimate_from_graphs(_fw, _bw, tag=_tag)
+
+    flops_estimator.report()
+    flops_estimator.save_report(model_name=model_name)
 
     # ──────────────────────────────────────────────────────────────────────────
     # 5. 运行时峰值显存 & 耗时对比（同进程内）
     # ──────────────────────────────────────────────────────────────────────────
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     if _device != "cuda":
-        print(f"\n[阶段 4/4] 跳过显存分析（非 GPU 环境）")
+        print(f"\n[阶段 4/5] 跳过显存分析（非 GPU 环境）")
         print(_BOLD)
         return
 
-    print(f"\n[阶段 4/4] 运行时峰值显存 & 耗时对比")
+    print(f"\n[阶段 4/5] 运行时峰值显存 & 耗时对比")
     print(_LINE)
     analyzer = MemoryProfiler(device=_device)
     analyzer.estimate_parameter_memory(transformer)
@@ -347,6 +388,19 @@ def main():
 
     analyzer.profile_step("ATenIR_recompute",
                           forward_fn=_recomputed_forward, optimizer=_prof_opt)
+
+    # ── 静态激活对比（修复 static_memory.png）────────────────────────────────
+    # 用阶段 3 统一捕获的 strategy 0 和 strategy N 的 FW/BW 图
+    if "no_recompute" in _captured_graphs and _strat_tag in _captured_graphs:
+        _nr_fw, _nr_bw = _captured_graphs["no_recompute"]
+        _rc_fw, _rc_bw = _captured_graphs[_strat_tag]
+        analyzer.estimate(
+            fw_before=_nr_fw, bw_before=_nr_bw,
+            fw_after=_rc_fw, bw_after=_rc_bw,
+        )
+
+    # ── 静态 vs 运行时精度对比 ────────────────────────────────────────────
+    analyzer.compare_with_static(static_estimator)
 
     # ── 报告与保存 ───────────────────────────────────────────────────────────
     analyzer.report()
