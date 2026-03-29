@@ -1,95 +1,60 @@
-"""Unified CLI entry for transformer experiments with YAML config + schema validation."""
+"""Single entrypoint for transformer workflow with strict YAML validation."""
 
 import argparse
-import os
-import subprocess
-import sys
-from pathlib import Path
 
-from config_loader import (
+from config_strict import (
     apply_env,
-    default_config_path,
-    default_schema_path,
-    get_task_args,
-    get_task_from_config,
-    load_config,
-    validate_config,
+    default_input_config_path,
+    load_input_config,
+    validate_input_for_task,
 )
 
-TASK_TO_SCRIPT = {
-    "benchmark": "benchmark.py",
-    "train": "train.py",
-    "capture": "capture.py",
-    "custom-train": "custom_train.py",
-    "translate": "translate.py",
-    "zh-en-train": "zh_en_train.py",
-    "zh-en-translate": "zh_en_translate.py",
-}
+
+def _resolve_task(config: dict, cli_task: str | None) -> str:
+    if cli_task:
+        return cli_task
+    run = config.get("run", {})
+    if not isinstance(run, dict):
+        raise ValueError("config.run must be a mapping")
+    task = run.get("task")
+    if task not in {"benchmark", "capture"}:
+        raise ValueError("config.run.task must be one of: benchmark, capture")
+    return task
 
 
-def parse_args() -> tuple[argparse.Namespace, list[str]]:
-    parser = argparse.ArgumentParser(
-        description="Unified transformer runner with YAML config and schema checks."
-    )
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Transformer single workflow entry")
     parser.add_argument(
         "task",
         nargs="?",
-        choices=sorted(TASK_TO_SCRIPT.keys()),
-        help="Optional task override. If absent, use run.task from config.",
+        choices=["benchmark", "capture"],
+        help="Main workflow task to run (optional; defaults to YAML run.task)",
     )
     parser.add_argument(
         "--config",
-        default=str(default_config_path()),
-        help="Path to experiment YAML config.",
+        default=str(default_input_config_path()),
+        help="Path to YAML input file",
     )
-    parser.add_argument(
-        "--schema",
-        default=str(default_schema_path()),
-        help="Path to JSON Schema for config validation.",
-    )
-    parser.add_argument(
-        "--validate-only",
-        action="store_true",
-        help="Only validate config and exit.",
-    )
-    parser.add_argument(
-        "--print-command",
-        action="store_true",
-        help="Print resolved command before execution.",
-    )
-    return parser.parse_known_args()
+    return parser.parse_args()
 
 
 def main() -> int:
-    args, passthrough = parse_args()
-
-    config_path = Path(args.config).resolve()
-    schema_path = Path(args.schema).resolve()
-
-    config = load_config(config_path)
-    validate_config(config, schema_path)
+    args = parse_args()
+    config = load_input_config(args.config)
+    task = _resolve_task(config, args.task)
+    validate_input_for_task(config, task)
     apply_env(config)
 
-    task = args.task or get_task_from_config(config)
-    task_args = get_task_args(config, task)
+    if task == "benchmark":
+        from benchmark_flow.runner import main as benchmark_main
 
-    if args.validate_only:
-        print(f"Config valid: {config_path}")
-        print(f"Schema used:  {schema_path}")
-        print(f"Task:         {task}")
+        benchmark_main(config_path=args.config)
         return 0
 
-    script = TASK_TO_SCRIPT[task]
-    script_path = Path(__file__).resolve().parent / script
+    from capture_flow.runner import main as capture_main
 
-    cmd = [sys.executable, str(script_path), *task_args, *passthrough]
-    if args.print_command:
-        print("Resolved command:")
-        print(" ".join(cmd))
-        print(f"RECOMPUTE={os.environ.get('RECOMPUTE', '{}')}")
-
-    proc = subprocess.run(cmd, check=False)
-    return int(proc.returncode)
+    capture_main(config_path=args.config)
+    return 0
 
 
 if __name__ == "__main__":

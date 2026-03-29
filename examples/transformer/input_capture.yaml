@@ -1,0 +1,18 @@
+version: 1
+
+run:
+  task: capture
+
+env:
+  model_name: Transformer
+  recompute:
+    "6": 0
+  recompute_log_level: INFO
+
+capture:
+  mode: static
+  batch_size: 2
+  seq_len: 32
+  dynamic: false
+  static_profile: fast
+  compare_runtime: false

@@ -1,0 +1,27 @@
+version: 1
+
+run:
+  task: capture
+
+env:
+  model_name: Transformer
+  recompute:
+    "1": 0
+  recompute_log_level: INFO
+  # project_root: /user/tangchengxiang/毕设/ATenIR-Selective-Recomputation
+  # run_id: exp_001
+  # save_joint_graph: true
+
+capture:
+  mode: static
+  batch_size: 2
+  seq_len: 32
+  dynamic: false
+  static_profile: fast
+  compare_runtime: false
+
+
+benchmark:
+  # 训练/基准配置
+  batch_size: 64
+  n_steps: 10
