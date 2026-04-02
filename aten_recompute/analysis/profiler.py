@@ -376,14 +376,27 @@ class MemoryProfiler:
         # ── 采样 ──
         print(f"  [{tag}] 采样 {steps} 步...")
         peak_mem_list: List[int]   = []
+        peak_abs_list: List[int]   = []
+        base_mem_list: List[int]   = []
         elapsed_list:  List[float] = []
         forward_list:  List[float] = []
         backward_list: List[float] = []
         optim_list:    List[float] = []
+        forward_peak_list: List[int] = []
+        backward_peak_list: List[int] = []
+        optimizer_peak_list: List[int] = []
+        forward_peak_abs_list: List[int] = []
+        backward_peak_abs_list: List[int] = []
+        optimizer_peak_abs_list: List[int] = []
+        forward_base_list: List[int] = []
+        backward_base_list: List[int] = []
+        optimizer_base_list: List[int] = []
 
         for i in range(steps):
+            base_mem = 0
             if is_cuda:
                 torch.cuda.reset_peak_memory_stats(self.device)
+                base_mem = torch.cuda.memory_allocated(self.device)
 
             if is_phased:
                 # ── 分阶段计时 ──
@@ -396,18 +409,55 @@ class MemoryProfiler:
                     ev2 = torch.cuda.Event(enable_timing=True)
                     ev3 = torch.cuda.Event(enable_timing=True)
 
+                    whole_base = base_mem
+
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                    fw_base = torch.cuda.memory_allocated(self.device)
                     ev0.record()
                     loss = forward_fn()
                     ev1.record()
+                    torch.cuda.synchronize(self.device)
+                    fw_peak_abs = torch.cuda.max_memory_allocated(self.device)
+                    fw_peak_vs_base = max(0, fw_peak_abs - fw_base)
+                    whole_peak_after_fw = max(0, fw_peak_abs - whole_base)
+
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                    bw_base = torch.cuda.memory_allocated(self.device)
                     loss.backward()
                     ev2.record()
+                    torch.cuda.synchronize(self.device)
+                    bw_peak_abs = torch.cuda.max_memory_allocated(self.device)
+                    bw_peak_vs_base = max(0, bw_peak_abs - bw_base)
+                    whole_peak_after_bw = max(0, bw_peak_abs - whole_base)
+
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                    opt_base = torch.cuda.memory_allocated(self.device)
                     optimizer.step()
                     ev3.record()
-                    torch.cuda.synchronize()
+                    torch.cuda.synchronize(self.device)
+                    opt_peak_abs = torch.cuda.max_memory_allocated(self.device)
+                    opt_peak_vs_base = max(0, opt_peak_abs - opt_base)
+                    whole_peak_after_opt = max(0, opt_peak_abs - whole_base)
 
                     fw_ms  = ev0.elapsed_time(ev1)
                     bw_ms  = ev1.elapsed_time(ev2)
                     opt_ms = ev2.elapsed_time(ev3)
+
+                    forward_base_list.append(fw_base)
+                    backward_base_list.append(bw_base)
+                    optimizer_base_list.append(opt_base)
+                    forward_peak_abs_list.append(fw_peak_abs)
+                    backward_peak_abs_list.append(bw_peak_abs)
+                    optimizer_peak_abs_list.append(opt_peak_abs)
+                    forward_peak_list.append(fw_peak_vs_base)
+                    backward_peak_list.append(bw_peak_vs_base)
+                    optimizer_peak_list.append(opt_peak_vs_base)
+
+                    peak_abs_list.append(max(fw_peak_abs, bw_peak_abs, opt_peak_abs))
+                    base_mem_list.append(whole_base)
+                    peak_mem_list.append(max(whole_peak_after_fw, whole_peak_after_bw, whole_peak_after_opt))
+
+                    torch.cuda.reset_peak_memory_stats(self.device)
                 else:
                     # CPU 回退：perf_counter
                     t_fw = time.perf_counter()
@@ -421,6 +471,16 @@ class MemoryProfiler:
                     t_opt = time.perf_counter()
                     optimizer.step()
                     opt_ms = (time.perf_counter() - t_opt) * 1000
+
+                    forward_peak_list.append(-1)
+                    backward_peak_list.append(-1)
+                    optimizer_peak_list.append(-1)
+                    forward_peak_abs_list.append(-1)
+                    backward_peak_abs_list.append(-1)
+                    optimizer_peak_abs_list.append(-1)
+                    forward_base_list.append(-1)
+                    backward_base_list.append(-1)
+                    optimizer_base_list.append(-1)
 
                 forward_list.append(fw_ms)
                 backward_list.append(bw_ms)
@@ -442,8 +502,11 @@ class MemoryProfiler:
                     elapsed_list.append((time.perf_counter() - t0) * 1000)
 
             # 峰值显存采集
-            if is_cuda:
-                peak_mem_list.append(torch.cuda.max_memory_allocated(self.device))
+            if is_cuda and not is_phased:
+                peak_abs = torch.cuda.max_memory_allocated(self.device)
+                peak_abs_list.append(peak_abs)
+                base_mem_list.append(base_mem)
+                peak_mem_list.append(max(0, peak_abs - base_mem))
             elif proc is not None:
                 peak_mem_list.append(proc.memory_info().rss)
 
@@ -463,6 +526,24 @@ class MemoryProfiler:
             max_peak = -1.0
             min_peak = -1.0
 
+        if peak_abs_list:
+            avg_peak_abs = sum(peak_abs_list) / len(peak_abs_list)
+            max_peak_abs = float(max(peak_abs_list))
+            min_peak_abs = float(min(peak_abs_list))
+        else:
+            avg_peak_abs = -1.0
+            max_peak_abs = -1.0
+            min_peak_abs = -1.0
+
+        if base_mem_list:
+            avg_base_mem = sum(base_mem_list) / len(base_mem_list)
+        else:
+            avg_base_mem = -1.0
+
+        display_peak = avg_peak_abs if avg_peak_abs >= 0 else avg_peak
+        display_peak_min = min_peak_abs if min_peak_abs >= 0 else min_peak
+        display_peak_max = max_peak_abs if max_peak_abs >= 0 else max_peak
+
         avg_time = sum(elapsed_list) / len(elapsed_list)
         max_time = max(elapsed_list)
         min_time = min(elapsed_list)
@@ -472,10 +553,16 @@ class MemoryProfiler:
             'tag': tag,
             'device': self.device,
             'peak_memory_bytes': peak_mem_list,
+            'peak_memory_abs_bytes': peak_abs_list,
+            'base_memory_bytes': base_mem_list,
             'elapsed_ms': elapsed_list,
             'avg_peak_bytes': avg_peak,
             'max_peak_bytes': max_peak,
             'min_peak_bytes': min_peak,
+            'avg_peak_abs_bytes': avg_peak_abs,
+            'max_peak_abs_bytes': max_peak_abs,
+            'min_peak_abs_bytes': min_peak_abs,
+            'avg_base_memory_bytes': avg_base_mem,
             'avg_elapsed_ms': avg_time,
             'max_elapsed_ms': max_time,
             'min_elapsed_ms': min_time,
@@ -498,22 +585,54 @@ class MemoryProfiler:
             result['iqr_forward_ms']  = _iqr_mean(forward_list)
             result['iqr_backward_ms'] = _iqr_mean(backward_list)
             result['iqr_optimizer_ms'] = _iqr_mean(optim_list)
+            result['forward_peak_bytes'] = forward_peak_list
+            result['backward_peak_bytes'] = backward_peak_list
+            result['optimizer_peak_bytes'] = optimizer_peak_list
+            result['forward_peak_abs_bytes'] = forward_peak_abs_list
+            result['backward_peak_abs_bytes'] = backward_peak_abs_list
+            result['optimizer_peak_abs_bytes'] = optimizer_peak_abs_list
+            result['forward_base_bytes'] = forward_base_list
+            result['backward_base_bytes'] = backward_base_list
+            result['optimizer_base_bytes'] = optimizer_base_list
+            result['avg_forward_peak_bytes'] = sum(forward_peak_list) / len(forward_peak_list)
+            result['avg_backward_peak_bytes'] = sum(backward_peak_list) / len(backward_peak_list)
+            result['avg_optimizer_peak_bytes'] = sum(optimizer_peak_list) / len(optimizer_peak_list)
+            result['max_forward_peak_bytes'] = float(max(forward_peak_list))
+            result['max_backward_peak_bytes'] = float(max(backward_peak_list))
+            result['max_optimizer_peak_bytes'] = float(max(optimizer_peak_list))
+            result['avg_forward_peak_abs_bytes'] = sum(forward_peak_abs_list) / len(forward_peak_abs_list)
+            result['avg_backward_peak_abs_bytes'] = sum(backward_peak_abs_list) / len(backward_peak_abs_list)
+            result['avg_optimizer_peak_abs_bytes'] = sum(optimizer_peak_abs_list) / len(optimizer_peak_abs_list)
+            result['avg_forward_base_bytes'] = sum(forward_base_list) / len(forward_base_list)
+            result['avg_backward_base_bytes'] = sum(backward_base_list) / len(backward_base_list)
+            result['avg_optimizer_base_bytes'] = sum(optimizer_base_list) / len(optimizer_base_list)
+            result['iqr_forward_peak_bytes'] = _iqr_mean(forward_peak_list)
+            result['iqr_backward_peak_bytes'] = _iqr_mean(backward_peak_list)
+            result['iqr_optimizer_peak_bytes'] = _iqr_mean(optimizer_peak_list)
 
         self._runtime_results[tag] = result
 
         # ── 打印摘要 ──
-        if avg_peak >= 0:
-            peak_str = f"平均 {_fmt_bytes(avg_peak)} [最小 {_fmt_bytes(min_peak)} / 最大 {_fmt_bytes(max_peak)}]"
+        if display_peak >= 0:
+            peak_str = f"平均 {_fmt_bytes(display_peak)} [最小 {_fmt_bytes(display_peak_min)} / 最大 {_fmt_bytes(display_peak_max)}]"
         else:
             peak_str = "N/A（CPU 环境，请安装 psutil 以测量 RSS）" if not _PSUTIL_AVAILABLE else "N/A"
 
         summary = f"  [{tag}] 峰值显存: {peak_str}, IQR步时: {iqr_time:.1f} ms"
+        if avg_base_mem >= 0:
+            summary += f" | 基线占用: {_fmt_bytes(avg_base_mem)}"
         if is_phased:
             summary += (
                 f" (FW {result['iqr_forward_ms']:.1f}"
                 f" / BW {result['iqr_backward_ms']:.1f}"
                 f" / Opt {result['iqr_optimizer_ms']:.1f})"
             )
+            if avg_peak >= 0:
+                summary += (
+                    f" | phase峰值: FW {_fmt_bytes(result['iqr_forward_peak_bytes'])}"
+                    f" / BW {_fmt_bytes(result['iqr_backward_peak_bytes'])}"
+                    f" / Opt {_fmt_bytes(result['iqr_optimizer_peak_bytes'])}"
+                )
         if compile_ms > 0:
             summary += f", 编译: {compile_ms:.0f} ms"
         print(summary)
@@ -536,7 +655,7 @@ class MemoryProfiler:
         print("  运行时内存 & 耗时对比")
         print(line)
 
-        has_mem   = any(r['avg_peak_bytes'] >= 0 for r in self._runtime_results.values())
+        has_mem   = any(r.get('avg_peak_abs_bytes', r['avg_peak_bytes']) >= 0 for r in self._runtime_results.values())
         has_phase = any('forward_ms' in r for r in self._runtime_results.values())
 
         # ── 表头 ──
@@ -558,8 +677,9 @@ class MemoryProfiler:
         for tag, r in self._runtime_results.items():
             row = f"  {tag:<22}"
             if has_mem:
-                if r['avg_peak_bytes'] >= 0:
-                    row += f" {_fmt_bytes(r['avg_peak_bytes']):>12}"
+                display_peak = r.get('avg_peak_abs_bytes', r['avg_peak_bytes'])
+                if display_peak >= 0:
+                    row += f" {_fmt_bytes(display_peak):>12}"
                 else:
                     row += f" {'N/A':>12}"
             compile_str = f"{r['compile_ms']:.0f} ms" if r.get('compile_ms', 0) > 0 else "N/A"
@@ -590,11 +710,16 @@ class MemoryProfiler:
 
                 # 显存对比
                 mem_saved_bytes = 0.0
-                if has_mem and r_base['avg_peak_bytes'] >= 0 and r_cmp['avg_peak_bytes'] >= 0:
-                    mem_delta = r_base['avg_peak_bytes'] - r_cmp['avg_peak_bytes']
+                base_peak = r_base.get('avg_peak_abs_bytes', r_base['avg_peak_bytes'])
+                cmp_peak = r_cmp.get('avg_peak_abs_bytes', r_cmp['avg_peak_bytes'])
+                if has_mem and base_peak >= 0 and cmp_peak >= 0:
+                    mem_delta = base_peak - cmp_peak
                     mem_saved_bytes = mem_delta
                     mem_dir = "节省" if mem_delta >= 0 else "增加"
                     print(f"    峰值显存{mem_dir}: {_fmt_bytes(abs(mem_delta))}")
+                    if r_base.get('avg_base_memory_bytes', -1) >= 0 and r_cmp.get('avg_base_memory_bytes', -1) >= 0:
+                        base_delta = r_base['avg_base_memory_bytes'] - r_cmp['avg_base_memory_bytes']
+                        print(f"    基线占用变化: {base_delta / (1 << 30):+.2f} GB")
 
                 print(f"    耗时变化: {time_delta:+.1f} ms ({time_pct:+.1f}%) {time_dir}")
 
@@ -816,6 +941,7 @@ class MemoryProfiler:
         model_name: Optional[str] = None,
         subfolder: str = "memory",
         save_plots: bool = True,
+        extra_payload: Optional[Dict] = None,
     ) -> str:
         """将分析结果以 JSON 格式保存到 IR_artifacts 目录，并可选生成内存图。"""
         from ..utils.save_ir import _default_ir_dir  # 延迟导入，避免循环依赖
@@ -862,35 +988,49 @@ class MemoryProfiler:
             runtime_payload = {}
             for tag, r in self._runtime_results.items():
                 entry = {
-                    'avg_peak_bytes':    r['avg_peak_bytes'],
-                    'max_peak_bytes':    r['max_peak_bytes'],
-                    'min_peak_bytes':    r['min_peak_bytes'],
-                    'avg_elapsed_ms':    r['avg_elapsed_ms'],
-                    'max_elapsed_ms':    r['max_elapsed_ms'],
-                    'min_elapsed_ms':    r['min_elapsed_ms'],
+                    'avg_peak_bytes': r['avg_peak_bytes'],
+                    'max_peak_bytes': r['max_peak_bytes'],
+                    'min_peak_bytes': r['min_peak_bytes'],
+                    'avg_peak_abs_bytes': r.get('avg_peak_abs_bytes', -1.0),
+                    'max_peak_abs_bytes': r.get('max_peak_abs_bytes', -1.0),
+                    'min_peak_abs_bytes': r.get('min_peak_abs_bytes', -1.0),
+                    'avg_base_memory_bytes': r.get('avg_base_memory_bytes', -1.0),
+                    'avg_elapsed_ms': r['avg_elapsed_ms'],
+                    'max_elapsed_ms': r['max_elapsed_ms'],
+                    'min_elapsed_ms': r['min_elapsed_ms'],
                     'median_elapsed_ms': r['median_elapsed_ms'],
-                    'iqr_elapsed_ms':    r['iqr_elapsed_ms'],
-                    'compile_ms':        r['compile_ms'],
+                    'iqr_elapsed_ms': r['iqr_elapsed_ms'],
+                    'compile_ms': r['compile_ms'],
                     'peak_memory_bytes': r['peak_memory_bytes'],
-                    'elapsed_ms':        r['elapsed_ms'],
-                    'device':            r['device'],
+                    'peak_memory_abs_bytes': r.get('peak_memory_abs_bytes', []),
+                    'base_memory_bytes': r.get('base_memory_bytes', []),
+                    'elapsed_ms': r['elapsed_ms'],
+                    'device': r['device'],
                 }
-                # 分阶段字段（仅 phased 模式产生）
-                if 'forward_ms' in r:
-                    entry.update({
-                        'forward_ms':          r['forward_ms'],
-                        'backward_ms':         r['backward_ms'],
-                        'optimizer_ms':        r['optimizer_ms'],
-                        'median_forward_ms':   r['median_forward_ms'],
-                        'median_backward_ms':  r['median_backward_ms'],
-                        'median_optimizer_ms': r['median_optimizer_ms'],
-                        'iqr_forward_ms':      r['iqr_forward_ms'],
-                        'iqr_backward_ms':     r['iqr_backward_ms'],
-                        'iqr_optimizer_ms':    r['iqr_optimizer_ms'],
-                    })
-                runtime_payload[tag] = entry
-            payload['runtime'] = runtime_payload
+                for key in (
+                    'forward_ms', 'backward_ms', 'optimizer_ms',
+                    'avg_forward_ms', 'avg_backward_ms', 'avg_optimizer_ms',
+                    'median_forward_ms', 'median_backward_ms', 'median_optimizer_ms',
+                    'iqr_forward_ms', 'iqr_backward_ms', 'iqr_optimizer_ms',
+                    'forward_peak_bytes', 'backward_peak_bytes', 'optimizer_peak_bytes',
+                    'forward_peak_abs_bytes', 'backward_peak_abs_bytes', 'optimizer_peak_abs_bytes',
+                    'forward_base_bytes', 'backward_base_bytes', 'optimizer_base_bytes',
+                    'avg_forward_peak_bytes', 'avg_backward_peak_bytes', 'avg_optimizer_peak_bytes',
+                    'max_forward_peak_bytes', 'max_backward_peak_bytes', 'max_optimizer_peak_bytes',
+                    'avg_forward_peak_abs_bytes', 'avg_backward_peak_abs_bytes', 'avg_optimizer_peak_abs_bytes',
+                    'avg_forward_base_bytes', 'avg_backward_base_bytes', 'avg_optimizer_base_bytes',
+                    'iqr_forward_peak_bytes', 'iqr_backward_peak_bytes', 'iqr_optimizer_peak_bytes',
+                ):
+                    if key in r:
+                        entry[key] = r[key]
 
+                for key in ('note', 'runtime_note', 'runtime_error', 'correctness'):
+                    if key in r:
+                        entry[key] = r[key]
+
+                runtime_payload[tag] = entry
+
+            payload['runtime'] = runtime_payload
             # 写入与基准的对比数据
             tags = list(self._runtime_results.keys())
             if len(tags) >= 2:
@@ -916,6 +1056,9 @@ class MemoryProfiler:
                             ) / iqr_delta
                     comparisons.append(entry)
                 payload['runtime_comparisons'] = comparisons
+
+        if extra_payload:
+            payload.update(extra_payload)
 
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)

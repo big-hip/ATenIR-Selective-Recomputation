@@ -49,9 +49,20 @@ class CompilerBackend:
         是否保存切分后的 FW/BW 图 IR 产物。
     """
 
-    def __init__(self, strategy_config: Optional[dict] = None, save_ir: bool = False):
+    def __init__(
+        self,
+        strategy_config: Optional[dict] = None,
+        save_ir: bool = False,
+        mode: str = "runtime",
+        use_meta: bool = False,
+        use_decomp: bool = True,
+    ):
         self.strategy_config = strategy_config
         self.save_ir = save_ir
+        # 兼容新版调用方（capture/benchmark 分阶段）传入的参数。
+        self.mode = mode
+        self.use_meta = use_meta
+        self.use_decomp = use_decomp
         self.fw_gm: Optional[fx.GraphModule] = None
         self.bw_gm: Optional[fx.GraphModule] = None
 
@@ -85,7 +96,7 @@ class CompilerBackend:
                 fw_compiler=fw_compiler,
                 bw_compiler=bw_compiler,
                 partition_fn=partition_fn,
-                decompositions=select_decomp_table(),
+                decompositions=select_decomp_table() if self.use_decomp else None,
             )
 
 

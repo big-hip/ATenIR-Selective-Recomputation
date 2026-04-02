@@ -12,7 +12,7 @@ import torch
 import torch.fx as fx
 
 from ..utils.logger import get_logger
-from ..utils.graph_utils import get_output_node
+from ..utils.graph_utils import get_fw_bw_boundary_info, get_output_node
 
 logger = get_logger(__name__)
 
@@ -53,29 +53,7 @@ def _saved_activation_bytes(
       - activations : FW 中间计算结果（op != 'placeholder'），是重计算真正要消除的对象
       - primals     : FW placeholder 节点直接透传给 BW（模型参数），本就长驻显存，
                       重计算无法"节省"这部分，但添加新的 primal 会让此类增加
-
-    Returns:
-        {
-            'activation_bytes':  int,
-            'primal_bytes':      int,
-            'total_bytes':       int,
-            'num_activations':   int,
-            'num_primals':       int,
-            'skipped':           int,
-            'activation_details': list,
-            'primal_details':    list,
-        }
     """
-    fw_placeholder_names = {
-        n.name for n in fw_gm.graph.nodes if n.op == 'placeholder'
-    }
-
-    bw_ph_names = {
-        n.name
-        for n in bw_gm.graph.nodes
-        if n.op == 'placeholder' and not n.name.startswith('tangents_')
-    }
-
     output_node = get_output_node(fw_gm)
     if output_node is None:
         return {
@@ -84,38 +62,29 @@ def _saved_activation_bytes(
             'activation_details': [], 'primal_details': [],
         }
 
-    act_details:    List[Dict] = []
+    boundary = get_fw_bw_boundary_info(fw_gm, bw_gm)
+    act_details: List[Dict] = []
     primal_details: List[Dict] = []
-    act_bytes    = 0
-    primal_bytes = 0
-    skipped      = 0
+    skipped = 0
 
-    for node in output_node.all_input_nodes:
-        if node.name not in bw_ph_names:
-            continue
-        val = node.meta.get('val')
-        if val is None or not isinstance(val, torch.Tensor):
+    for entry in boundary['saved_nodes']:
+        detail = {
+            'name': entry['name'],
+            'shape': entry['shape'],
+            'dtype': entry['dtype'],
+            'bytes': entry['bytes'],
+        }
+        if not entry['is_tensor']:
             skipped += 1
             logger.debug(
-                "[MemoryAnalyzer] 节点 '%s' meta['val'] 缺失或非 Tensor，跳过。",
-                node.name,
+                "[MemoryAnalyzer] 节点 '%s' meta['val']/tensor_meta 缺失或非 Tensor，跳过。",
+                entry['name'],
             )
             continue
-
-        nb = _tensor_bytes(val)
-        entry = {
-            'name':  node.name,
-            'shape': [int(d) for d in val.shape],
-            'dtype': str(val.dtype),
-            'bytes': nb,
-        }
-
-        if node.name in fw_placeholder_names:
-            primal_bytes += nb
-            primal_details.append(entry)
+        if entry['kind'] == 'primal':
+            primal_details.append(detail)
         else:
-            act_bytes += nb
-            act_details.append(entry)
+            act_details.append(detail)
 
     if skipped:
         logger.debug(
@@ -124,12 +93,12 @@ def _saved_activation_bytes(
         )
 
     return {
-        'activation_bytes':  act_bytes,
-        'primal_bytes':      primal_bytes,
-        'total_bytes':       act_bytes + primal_bytes,
-        'num_activations':   len(act_details),
-        'num_primals':       len(primal_details),
-        'skipped':           skipped,
+        'activation_bytes': boundary['activation_bytes'],
+        'primal_bytes': boundary['primal_bytes'],
+        'total_bytes': boundary['total_bytes'],
+        'num_activations': len(act_details),
+        'num_primals': len(primal_details),
+        'skipped': skipped,
         'activation_details': act_details,
-        'primal_details':    primal_details,
+        'primal_details': primal_details,
     }

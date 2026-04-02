@@ -16,13 +16,14 @@ _BOLD = "═" * 68
 
 
 def main(config_path: str | None = None):
-    _, bcfg, model_map, model_name, strategy_config = load_benchmark_config(config_path)
+    _, bcfg, model_map, model_name, strategy_config, methods = load_benchmark_config(config_path)
     _, strat_tag = build_strategy_tag(strategy_config)
 
     train_ctx = run_train_validation(
         model_map=model_map,
         bcfg=bcfg,
         strategy_config=strategy_config,
+        methods=methods,
         model_name=model_name,
         line=_LINE,
         bold=_BOLD,
@@ -30,6 +31,7 @@ def main(config_path: str | None = None):
 
     static_ctx = run_static_analysis(
         train_ctx=train_ctx,
+        methods=methods,
         strategy_config=strategy_config,
         strat_tag=strat_tag,
         model_name=model_name,
@@ -39,8 +41,16 @@ def main(config_path: str | None = None):
     run_runtime_analysis(
         train_ctx=train_ctx,
         static_ctx=static_ctx,
+        methods=methods,
+        strategy_config=strategy_config,
         strat_tag=strat_tag,
         model_name=model_name,
         line=_LINE,
         bold=_BOLD,
     )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

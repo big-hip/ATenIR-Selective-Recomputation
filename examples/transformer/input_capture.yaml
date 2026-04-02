@@ -1,3 +1,9 @@
+# Legacy capture-only sample.
+#
+# Current main workflow uses `input.yaml` as the single default config.
+# This file is kept only as a minimal capture-specific example and is NOT
+# referenced by default entrypoints.
+
 version: 1
 
 run:
@@ -6,7 +12,7 @@ run:
 env:
   model_name: Transformer
   recompute:
-    "6": 0
+    "7": 1.0
   recompute_log_level: INFO
 
 capture:
@@ -16,3 +22,6 @@ capture:
   dynamic: false
   static_profile: fast
   compare_runtime: false
+
+# If you do not need a separate capture-only sample anymore,
+# this file can be removed in a later cleanup pass.

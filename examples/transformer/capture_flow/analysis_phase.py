@@ -4,7 +4,12 @@ def run_runtime_signature_compare(args, ctx: dict, model_map: dict, strategy_con
     from model import device as default_device
     from model_loader import build_transformer_from_map
     from aten_recompute.core import CompilerBackend
-    from meta_pipeline import compare_graph_signatures, inject_transformer_layer_tags, run_train_step
+    from meta_pipeline import (
+        compare_capture_semantics,
+        inject_transformer_layer_tags,
+        print_capture_semantics_report,
+        run_train_step,
+    )
 
     if not (args.mode == "static" and args.compare_runtime and torch.cuda.is_available()):
         return
@@ -37,24 +42,7 @@ def run_runtime_signature_compare(args, ctx: dict, model_map: dict, strategy_con
     rt_model.train()
     run_train_step(rt_compiled, rt_src, rt_tgt, tgt_vocab_size, criterion)
 
-    fw_cmp = compare_graph_signatures(backend.fw_gm, rt_backend.fw_gm)
-    bw_cmp = compare_graph_signatures(backend.bw_gm, rt_backend.bw_gm)
-    print(
-        f"  [FW] meta/runtime 节点数: {fw_cmp['meta_nodes']}/{fw_cmp['runtime_nodes']} "
-        f"(ratio={fw_cmp['ratio']:.3f})"
-    )
-    print(f"  [FW] 算子集合重叠: {fw_cmp['overlap']:.1%}")
-    if fw_cmp["top_diffs"]:
-        print("  [FW] Top-5 算子计数差异 (meta - runtime):")
-        for item in fw_cmp["top_diffs"]:
-            print(f"    {item['op']}: {item['delta']:+d}")
-
-    print(
-        f"  [BW] meta/runtime 节点数: {bw_cmp['meta_nodes']}/{bw_cmp['runtime_nodes']} "
-        f"(ratio={bw_cmp['ratio']:.3f})"
-    )
-    print(f"  [BW] 算子集合重叠: {bw_cmp['overlap']:.1%}")
-    if bw_cmp["top_diffs"]:
-        print("  [BW] Top-5 算子计数差异 (meta - runtime):")
-        for item in bw_cmp["top_diffs"]:
-            print(f"    {item['op']}: {item['delta']:+d}")
+    report = compare_capture_semantics(backend, rt_backend)
+    print_capture_semantics_report(report)
+    ctx["meta_runtime_compare"] = report
+    return report

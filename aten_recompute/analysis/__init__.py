@@ -6,6 +6,7 @@ aten_recompute.analysis — 内存分析与估算子包。
 
 from .profiler import MemoryProfiler
 from .static import StaticEstimator
+from .flops import FLOPsEstimator
 from .comparison import print_method_comparison, get_method_comparison_data
 from ._activations import _fmt_bytes, _saved_activation_bytes
 
@@ -18,6 +19,7 @@ __all__ = [
     "MemoryAnalyzer",
     "StaticEstimator",
     "StaticMemoryEstimator",
+    "FLOPsEstimator",
     "print_method_comparison",
     "get_method_comparison_data",
     "_fmt_bytes",

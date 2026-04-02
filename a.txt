@@ -1,0 +1,8 @@
+// {
+//   "env": {
+//     "ANTHROPIC_BASE_URL": "https://sub.jlypx.de",
+//     "ANTHROPIC_AUTH_TOKEN": "sk-422b645362eb317a7d7b67e011e3aec61f47f66a385621b574db3b455eb10112",
+//     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+//     "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
+//   }
+// }

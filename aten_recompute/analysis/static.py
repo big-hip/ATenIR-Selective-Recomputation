@@ -424,6 +424,7 @@ class StaticEstimator:
 
         result = {
             "tag": tag,
+            "provenance": "graph_exact",
             "param_bytes": param_bytes,
             "buffer_bytes": self._param_memory["buffer_bytes"],
             "fw_peak_bytes": fw_result["peak_bytes"],
@@ -651,6 +652,7 @@ class StaticEstimator:
 
             result = {
                 "tag": tag,
+                "provenance": "formula_derived",
                 "param_bytes": param_bytes,
                 "buffer_bytes": baseline["buffer_bytes"],
                 "fw_peak_bytes": fw_peak_bytes,

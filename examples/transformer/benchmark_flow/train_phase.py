@@ -5,6 +5,7 @@ def run_train_validation(
     model_map: dict,
     bcfg: dict,
     strategy_config: dict,
+    methods: list,
     model_name: str,
     line: str,
     bold: str,
@@ -42,6 +43,7 @@ def run_train_validation(
     print(f"  批次大小:     {batch_size}")
     print(f"  序列长度:     {max_seq_length}")
     print(f"  训练步数:     {n_steps}")
+    print(f"  方法矩阵:     {', '.join(method.name for method in methods)}")
     print(line)
 
     clean_model = copy.deepcopy(transformer)
@@ -94,4 +96,8 @@ def run_train_validation(
         "src_vocab_size": src_vocab_size,
         "tgt_vocab_size": tgt_vocab_size,
         "max_seq_length": max_seq_length,
+        "methods": methods,
+        "model_map": model_map,
+        "n_steps": n_steps,
+        "benchmark_config": dict(bcfg),
     }

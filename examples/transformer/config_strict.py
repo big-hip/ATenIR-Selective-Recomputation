@@ -32,7 +32,7 @@ _REQUIRED_CAPTURE_KEYS = (
     "static_profile",
     "compare_runtime",
 )
-_REQUIRED_BENCHMARK_KEYS = ("batch_size", "n_steps")
+_REQUIRED_BENCHMARK_KEYS = ("batch_size", "n_steps", "run_correctness_checks")
 
 
 def default_input_config_path() -> Path:
