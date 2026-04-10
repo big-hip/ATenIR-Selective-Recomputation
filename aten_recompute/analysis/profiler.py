@@ -821,7 +821,7 @@ class MemoryProfiler:
             logger.warning("[MemoryProfiler] 尚未调用 profile_step()，无运行时数据可绘图。")
             return None
 
-        has_mem = any(r['avg_peak_bytes'] >= 0 for r in self._runtime_results.values())
+        has_mem = any(r.get('avg_peak_abs_bytes', r['avg_peak_bytes']) >= 0 for r in self._runtime_results.values())
         n_rows  = 2 if has_mem else 1
         fig, axes = plt.subplots(n_rows, 1, figsize=(8, 4 * n_rows), sharex=False)
         if n_rows == 1:
@@ -830,17 +830,19 @@ class MemoryProfiler:
         colors = ['steelblue', 'coral', 'seagreen', 'orchid', 'goldenrod']
         mb = 1 << 20
 
-        # ── 上图：峰值显存折线 ─────────────────────────────────────────────────
+        # ── 上图：峰值显存折线（优先绝对峰值，和 report 口径一致） ─────────────
         if has_mem:
             ax_mem = axes[0]
             for idx, (tag, r) in enumerate(self._runtime_results.items()):
-                if r['avg_peak_bytes'] < 0:
+                avg_peak_for_plot = r.get('avg_peak_abs_bytes', r['avg_peak_bytes'])
+                if avg_peak_for_plot < 0:
                     continue
-                steps  = list(range(1, len(r['peak_memory_bytes']) + 1))
-                values = [v / mb for v in r['peak_memory_bytes']]
+                peak_series = r.get('peak_memory_abs_bytes') or r.get('peak_memory_bytes', [])
+                steps  = list(range(1, len(peak_series) + 1))
+                values = [v / mb for v in peak_series]
                 color  = colors[idx % len(colors)]
                 ax_mem.plot(steps, values, marker='o', label=tag, color=color, linewidth=1.8)
-                ax_mem.axhline(r['avg_peak_bytes'] / mb, linestyle='--',
+                ax_mem.axhline(avg_peak_for_plot / mb, linestyle='--',
                                color=color, alpha=0.45, linewidth=1)
             ax_mem.set_xlabel('Step')
             ax_mem.set_ylabel('Peak Memory (MB)')

@@ -4,12 +4,12 @@
 version: 1
 
 run:
-  task: capture
+  task: benchmark
 
 env:
   model_name: Transformer
   recompute:
-    "7": 1.0
+    "1": 1.0
   recompute_log_level: INFO
   # project_root: /user/tangchengxiang/毕设/ATenIR-Selective-Recomputation
   # run_id: exp_001

@@ -65,6 +65,26 @@ class CompilerBackend:
         self.use_decomp = use_decomp
         self.fw_gm: Optional[fx.GraphModule] = None
         self.bw_gm: Optional[fx.GraphModule] = None
+        self.last_compile_debug: Optional[dict] = None
+
+    @staticmethod
+    def _summarize_sample_inputs(sample_inputs: list) -> list[dict]:
+        summary = []
+        for idx, inp in enumerate(sample_inputs):
+            if torch.is_tensor(inp):
+                summary.append(
+                    {
+                        "index": idx,
+                        "shape": tuple(inp.shape),
+                        "dtype": str(inp.dtype),
+                        "device": str(inp.device),
+                        "type": type(inp).__name__,
+                        "is_meta": bool(getattr(inp, "is_meta", False)),
+                    }
+                )
+            else:
+                summary.append({"index": idx, "type": type(inp).__name__})
+        return summary
 
     def __call__(self, gm: fx.GraphModule, sample_inputs: list):
         """torch.compile backend 回调。"""
@@ -89,6 +109,15 @@ class CompilerBackend:
         fake_mode = detect_fake_mode(sample_inputs)
         if not fake_mode:
             fake_mode = torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True)
+
+        self.last_compile_debug = {
+            "mode": self.mode,
+            "use_meta_flag": bool(self.use_meta),
+            "use_decomp": bool(self.use_decomp),
+            "fake_mode_type": type(fake_mode).__name__,
+            "sample_inputs": self._summarize_sample_inputs(sample_inputs),
+        }
+        logger.info("[CompilerBackend] compile debug: %s", self.last_compile_debug)
 
         with V.set_fake_mode(fake_mode):
             return aot_module_simplified(

@@ -68,6 +68,24 @@ def execute_capture(args, model_map: dict, strategy_config: dict, run_device):
 
     elapsed = time.time() - t0
 
+    compile_debug = getattr(backend, "last_compile_debug", None)
+    if compile_debug:
+        print("  [debug] compile path summary:")
+        print(
+            "    mode={mode} | use_meta_flag={use_meta_flag} | use_decomp={use_decomp} | fake_mode={fake_mode_type}".format(
+                **compile_debug
+            )
+        )
+        for item in compile_debug.get("sample_inputs", []):
+            if "shape" in item:
+                print(
+                    "    input[{index}] type={type} device={device} dtype={dtype} shape={shape} is_meta={is_meta}".format(
+                        **item
+                    )
+                )
+            else:
+                print("    input[{index}] type={type}".format(**item))
+
     return {
         "transformer": transformer,
         "backend": backend,
