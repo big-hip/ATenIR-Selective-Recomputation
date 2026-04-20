@@ -2,10 +2,11 @@
 
 > **文档定位**: 对本项目图捕获层（Pillar 2）的全链路源码解析，
 > 涵盖 `torch.compile` 编译流水线、Dynamo 字节码追踪、AOTAutograd 联合图生成、
-> FakeTensor 元信息传播、partition_fn 的 FW/BW 拆分机制、以及本项目
-> `capture_graphs()` 如何截获编译产物。
+> FakeTensor 元信息传播、partition_fn 的 FW/BW 拆分机制、
+> AOT 路径 `capture_graphs()` 和 Inductor 路径 `capture_inductor_graphs()` 双层捕获。
 >
 > **前置阅读**: `01-architecture.md` §四（图捕获概述）
+> **论文对应**: 第 2 章 §2.2
 
 ---
 
@@ -23,10 +24,18 @@
 变成两张带有 FakeTensor 元信息的 FX 图（`fw_gm` / `bw_gm`），
 供下游静态仿真在不执行真实 GPU 计算的情况下分析内存。
 
+本项目提供两条捕获路径：
+
+| 路径 | 函数 | 后端 | 下游仿真 |
+|------|------|------|----------|
+| AOT 路径 | `capture_graphs()` | aot_eager | L2 |
+| Inductor 路径 | `capture_inductor_graphs()` | inductor | L2 + L2.5 + L3 |
+
 关键产出：
 - **`fw_gm`**: 前向图，`output` = 用户输出 + saved activations
 - **`bw_gm`**: 反向图，`placeholder` = saved activations + tangent inputs
 - **每个节点的 `meta['val']`**: FakeTensor，携带 shape/dtype/stride/storage 信息
+- **(Inductor 路径) `sched_fw_peak` / `sched_bw_peak`**: Scheduler 估算的峰值内存
 
 ---
 
@@ -542,20 +551,61 @@ def analyze_graph(gm):
 
 ---
 
-## 八、IR 导出
+## 八、Inductor 路径: `capture_inductor_graphs()`
 
-> **注意**: `ir_saver.py` 已在 v6.1 代码清理中删除。以下保留作为设计参考。
+**源文件**: `toolkit/capture/inductor_capture.py`
 
-**原源文件**: `toolkit/capture/ir_saver.py`
+### 8.1 设计目的
+
+AOT 路径 (`capture_graphs`) 使用 aot_eager 后端，不经过 Inductor 编译。
+对于需要 L2.5/L3 仿真的 inductor 策略，需要捕获 Inductor 的 post-grad FX 图和 Scheduler 峰值。
+
+### 8.2 核心实现
 
 ```python
-def save_ir(gm, path):
-    rendered = gm.print_readable(print_output=False)
-    Path(path).write_text(rendered, encoding="utf-8")
+def capture_inductor_graphs(model, sample_input_ids, loss_fn, *,
+                            model_kwargs=None, dynamic=True, budget=None):
+    captured = {}
+
+    def inner_compile(gm, example_inputs):
+        # ① 截获 post-grad GraphModule（经过 Inductor 前端优化后的 FX 图）
+        captured[phase] = copy.deepcopy(gm)
+        # ② monkey-patch Scheduler.__init__，在其中调用 self.estimate_peak_memory()
+        #    捕获 sched_fw_peak / sched_bw_peak
+        return compile_fx_inner(gm, example_inputs)
+
+    compiled = torch.compile(model, backend=lambda gm, inputs:
+        compile_fx(gm, inputs, inner_compile=inner_compile))
+    # ... forward + backward 触发编译 ...
+    return captured  # {fw_gm, bw_gm, sched_fw_peak, sched_bw_peak}
 ```
 
-`print_readable()` 是 FX GraphModule 内置方法，输出人类可读的 Python-like IR，
-包括每个节点的 op、target、args，方便论文中展示或人工检查。
+### 8.3 与 AOT 路径的区别
+
+| 维度 | AOT 路径 | Inductor 路径 |
+|------|---------|---------------|
+| 后端 | aot_eager | inductor |
+| 截获点 | AOTAutograd fw/bw compiler | Inductor inner_compile |
+| 图类型 | 联合图 partition 后的 FW/BW | Inductor post-grad FX 图 |
+| 附加产出 | — | Scheduler 峰值估算 |
+| 下游仿真 | L2 | L2 + L2.5 + L3 |
+| budget 支持 | 通过 partition_fn | 通过 `set_memory_budget()` |
+
+### 8.4 Scheduler 峰值捕获
+
+Inductor 的 `Scheduler` 在编译时会调用 `estimate_peak_memory()` 来评估 buffer 调度方案的峰值内存。
+本项目通过 monkey-patch `Scheduler.__init__` 来捕获这个值：
+
+```python
+original_init = Scheduler.__init__
+def patched_init(self, nodes):
+    original_init(self, nodes)
+    captured[f"sched_{phase}_peak"] = self.estimate_peak_memory()
+Scheduler.__init__ = patched_init
+```
+
+`sched_fw_peak` 和 `sched_bw_peak` 即为 Scheduler 视角的 FW/BW 激活峰值，
+是 L3 仿真的核心输入。
 
 ---
 
@@ -695,22 +745,18 @@ output: (grad_primal_0, grad_primal_1, ..., grad_primal_N)  ← 对每个 requir
 
 ---
 
-## 十二、源码文件索引
+## 十三、源码文件索引
 
-| 文件 | 内容 | 行数 |
-|------|------|------|
-| `toolkit/capture/__init__.py` | 模块导出 | 4 行 |
-| `toolkit/capture/aot_capture.py` | `capture_graphs()` — 图捕获主入口 | 65 行 |
-| `toolkit/capture/analysis.py` | `graph_stats` + `analyze_graph` + `count_fw_output_bytes` | 95 行 |
-| ~~`toolkit/capture/ir_saver.py`~~ | `save_ir()` — 已删除 | - |
-| `torch/_functorch/aot_autograd.py:1007-1191` | `aot_module_simplified` — AOTAutograd 入口 |
-| `torch/_functorch/aot_autograd.py:585-836` | `_create_aot_dispatcher_function` — 核心调度 |
-| `torch/_functorch/_aot_autograd/dispatch_and_compile_graph.py:251-338` | `aot_dispatch_autograd_graph` — 联合图生成 |
-| `torch/_functorch/_aot_autograd/traced_function_transforms.py:192-282` | `create_joint` — FW+BW 联合函数 |
-| `torch/_functorch/_aot_autograd/dispatch_and_compile_graph.py:46-62` | `_create_graph` — make_fx 追踪 |
-| `torch/_functorch/partitioners.py:389-472` | `default_partition` — 默认分割 |
-| `torch/_functorch/partitioners.py:290-386` | `_extract_fwd_bwd_modules` — FW/BW 拆分 |
-| `torch/_functorch/partitioners.py:158-226` | `_extract_graph_with_inputs_outputs` — 子图提取 |
+| 文件 | 内容 |
+|------|------|
+| `toolkit/capture/__init__.py` | 模块导出 |
+| `toolkit/capture/aot_capture.py` | `capture_graphs()` — AOT 路径图捕获 |
+| `toolkit/capture/inductor_capture.py` | `capture_inductor_graphs()` — Inductor 路径 + L3 Scheduler hook |
+| `toolkit/capture/analysis.py` | `graph_stats` + `analyze_graph` + `count_fw_output_bytes` |
+| `torch/_functorch/aot_autograd.py` | `aot_module_simplified` — AOTAutograd 入口 |
+| `torch/_functorch/_aot_autograd/dispatch_and_compile_graph.py` | 联合图生成 + make_fx 追踪 |
+| `torch/_functorch/_aot_autograd/traced_function_transforms.py` | `create_joint` — FW+BW 联合函数 |
+| `torch/_functorch/partitioners.py` | `default_partition` / `min_cut` / `_extract_fwd_bwd_modules` |
 
 ---
 
@@ -719,6 +765,7 @@ output: (grad_primal_0, grad_primal_1, ..., grad_primal_N)  ← 对每个 requir
 - `01-architecture.md` §四：图捕获概述
 - `06-activation-memory-budget.md`：min-cut partition 详解
 - `07-ac-sac-deep-dive.md`：AC/SAC 如何影响 partition
-- `08-static-simulation-deep-dive.md`：L2 仿真如何消费 fw_gm/bw_gm
+- `08-static-simulation-deep-dive.md`：L2/L2.5/L3 仿真如何消费 fw_gm/bw_gm
+- `12-inductor-memory-analysis.md`：Inductor 后端内存分析详解
 - PyTorch docs: [torch.compile](https://pytorch.org/docs/stable/torch.compiler.html)
 - PyTorch docs: [AOTAutograd](https://pytorch.org/functorch/stable/notebooks/aot_autograd_optimizations.html)

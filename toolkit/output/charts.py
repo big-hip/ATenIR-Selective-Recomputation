@@ -49,7 +49,7 @@ def bar_chart_memory(results, save_path=None):
     fig.tight_layout()
     if save_path is not None:
         fig.savefig(save_path, bbox_inches="tight")
-    plt.close(fig)
+        plt.close(fig)
     return fig
 
 
@@ -67,7 +67,7 @@ def line_chart_mre(mre_list, save_path=None):
     fig.tight_layout()
     if save_path is not None:
         fig.savefig(save_path, bbox_inches="tight")
-    plt.close(fig)
+        plt.close(fig)
     return fig
 
 
@@ -100,7 +100,7 @@ def phase_timeline_chart(items, save_path=None):
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
-    plt.close(fig)
+        plt.close(fig)
     return fig
 
 
@@ -136,7 +136,7 @@ def phase_grouped_bar(items, save_path=None):
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
-    plt.close(fig)
+        plt.close(fig)
     return fig
 
 
@@ -173,7 +173,7 @@ def savings_waterfall(items, baseline_index=0, metric="true_peak", save_path=Non
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
-    plt.close(fig)
+        plt.close(fig)
     return fig
 
 
@@ -213,7 +213,7 @@ def stacked_breakdown(items, save_path=None):
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
-    plt.close(fig)
+        plt.close(fig)
     return fig
 
 
@@ -236,5 +236,5 @@ def heatmap_strategy_model(data, save_path=None):
     fig.tight_layout()
     if save_path is not None:
         fig.savefig(save_path, bbox_inches="tight")
-    plt.close(fig)
+        plt.close(fig)
     return fig

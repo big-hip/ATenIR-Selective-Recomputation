@@ -1,10 +1,11 @@
 # 08 — 静态仿真引擎源码深度解析
 
 > **文档定位**: 对本项目静态仿真引擎的全链路解析，
-> 涵盖 L1 配置公式法、L2 FX 图事件驱动法、view 检测、512B 对齐、
-> 四峰值体系、运行时验证机制，以及两层仿真的精度对比与误差来源分析。
+> 涵盖 L1 配置公式法、L2 FX 图事件驱动法、L2.5 融合感知仿真、L3 Scheduler 仿真、
+> view 检测、512B 对齐、四峰值体系、运行时验证机制，以及各层精度对比与误差来源分析。
 >
-> **前置阅读**: `01-architecture.md` §七（L1/L2 概述）
+> **前置阅读**: `01-architecture.md` §七（四层仿真概述）
+> **论文对应**: 第 2 章 §2.3-2.5
 
 ---
 
@@ -18,12 +19,12 @@
 静态仿真：分析编译产物（FX 图的 FakeTensor 元信息）→ 模拟 tensor 分配/释放 → 估算峰值。
 数秒内完成，支持批量策略对比。
 
-| 层级 | 名称 | 输入 | 精度 | 用途 |
-|------|------|------|------|------|
-| **L1** | Config 公式法 | 模型配置 (hidden, layers, ...) | MRE ~15-25% | 快速粗估、选型 |
-| **L2** | FX 图事件驱动 | 编译后的 fw_gm / bw_gm | MRE ~6.9% | 精确仿真、策略对比 |
-| L3 (未实现) | BFC 仿真 | L2 + allocator 碎片模拟 | 目标 <3% | 追踪碎片化 |
-| L4 (未实现) | CPU Replay | L2 + CUDA Caching Allocator replay | 目标 <1% | 最终验证 |
+| 层级 | 名称 | 输入 | 精度 (aot_eager) | 精度 (inductor) | 用途 |
+|------|------|------|-----------------|----------------|------|
+| **L1** | Config 公式法 | 模型配置 | MRE ~15-25% | — | 快速粗估、选型 |
+| **L2** | FX 图事件驱动 | fw_gm / bw_gm | **MRE 1-7%** | MRE 28-38% | 精确仿真 (aot_eager) |
+| **L2.5** | 融合感知图遍历 | fw_gm / bw_gm + fusion groups | — | **MRE 8-12%** | 近似建模 fusion |
+| **L3** | Inductor Scheduler | Scheduler 编译产物 | — | **MRE 5-7%** | 精确建模 fusion |
 
 ---
 
@@ -527,120 +528,173 @@ MRE (Mean Relative Error) = `|static - runtime| / runtime`，
 
 ---
 
-## 十一、误差来源分析
+## 十一、L2.5 融合感知仿真
 
-### 11.1 已建模（L2 覆盖）
+**源文件**: `toolkit/simulation/fusion_groups.py`, `toolkit/simulation/fusion_ops.py`, `toolkit/simulation/graph_estimator.py`
 
-| 因素 | 处理方式 |
-|------|---------|
-| Op 级激活生命周期 | 事件驱动遍历 + last_use 释放 |
-| View aliasing | `_cdata` storage 共享检测 → 跳过 |
-| SymInt 动态 shape | `hint_int(fallback=4096)` |
-| Allocator 对齐 | 512B 向上对齐 |
-| Saved activations | `pin_output_inputs=True` |
-| Optimizer 临时内存 | foreach Adam: `opt_temp = param_bytes` |
-| Weight tying | `data_ptr()` 去重 |
+### 11.1 背景
 
-### 11.2 未建模（L2 不覆盖，贡献 ~7% 残余 MRE）
+Inductor 后端将连续的 pointwise/reduction 算子融合成单个 Triton kernel，内部中间张量不在 GPU 全局内存中物化。L2 不建模 fusion → inductor MRE 28-38%。L2.5 通过近似融合组识别来降低这一误差。
 
-| 因素 | 影响 | 未来方案 |
-|------|------|---------|
-| CUDA context / driver 内存 | 16-19 MB 固定偏移 | L3: 加固定偏移修正 |
-| Allocator 碎片 | reserved >> allocated | L3: BFC 碎片仿真 |
-| Kernel 临时 buffer | 如 cuBLAS workspace | L4: CUDA 内存 replay |
-| 对齐粒度差异 | 小 tensor 多时累积 | L3: 精确 allocator 仿真 |
-| Dynamo frame / FX 图管理 | ~MB 级 | 通常可忽略 |
+### 11.2 算子分类 (`fusion_ops.py`)
 
-### 11.3 dark memory 量化
+```python
+EXTERN_OPS = {aten.mm, aten.bmm, aten.addmm, ...}  # 调用 CUBLAS/cuDNN，不参与融合
+
+def is_fusable_op(node) -> bool:
+    """非 extern 的 call_function 节点视为可融合。"""
+```
+
+### 11.3 融合组识别 (`fusion_groups.py`)
+
+```python
+def identify_fusion_groups(gm) -> list[FusionGroup]:
+    """贪心拓扑扫描：连续的 fusable ops 合并为一组。
+    组的边界在 extern op 或 graph 边界处切断。"""
+```
+
+每个 FusionGroup 包含：
+- `nodes`: 组内所有节点
+- `internal_nodes`: 仅组内消费的中间节点（分配设为 0）
+- `boundary_nodes`: 组的输入/输出节点（保留正常分配）
+
+### 11.4 融合感知估算
+
+```python
+estimate_graph_peak(gm, fusion_aware=True, optimize_order=True)
+```
+
+- `fusion_aware=True`: 识别融合组，internal 节点分配为 0
+- `optimize_order=True`: 贪心调度 — 优先执行释放内存最多的节点，最小化峰值
+
+L2.5 将 inductor MRE 从 28-38% 降低到 8-12%。
+
+---
+
+## 十二、L3 Scheduler 仿真
+
+**源文件**: `toolkit/capture/inductor_capture.py`, `toolkit/simulation/graph_estimator.py`
+
+### 12.1 背景
+
+L2.5 仍是近似融合。L3 直接复用 Inductor 编译器的 `Scheduler.estimate_peak_memory()` 方法，获得编译器视角的精确峰值估算。
+
+### 12.2 捕获机制
+
+```python
+def capture_inductor_graphs(model, input_ids, loss_fn, *, budget=None):
+    # 1. monkey-patch Scheduler.__init__，在其中调用 self.estimate_peak_memory()
+    # 2. 使用 compile_fx(inner_compile=hook) 截获 post-grad FW/BW GraphModule
+    # 3. 返回 {fw_gm, bw_gm, sched_fw_peak, sched_bw_peak}
+```
+
+### 12.3 三层封装
+
+```python
+def estimate_inductor_training_peak(capture_result, model, ...):
+    # L2: estimate_training_peak(fw_gm, bw_gm, model)
+    # L2.5: estimate_graph_peak(fw_gm, fusion_aware=True) + min(sched_bw, fusion_bw)
+    # L3: static_base + max(sched_fw_peak, sched_bw_peak + grad_bytes)
+    # 返回包含三层结果的 dict
+```
+
+L3 将 inductor MRE 从 8-12% 进一步降低到 5-7%。
+
+---
+
+## 十三、误差来源分析
+
+### 13.1 已建模（各层覆盖）
+
+| 因素 | L2 | L2.5 | L3 |
+|------|----|----- |----|
+| Op 级激活生命周期 | ✅ 事件驱动 | ✅ 事件驱动 | ✅ Scheduler |
+| View aliasing | ✅ `_cdata` | ✅ `_cdata` | ✅ Scheduler |
+| SymInt 动态 shape | ✅ `hint_int` | ✅ `hint_int` | ✅ |
+| 512B 对齐 | ✅ | ✅ | ✅ |
+| Saved activations | ✅ pin | ✅ pin | ✅ |
+| Optimizer 临时内存 | ✅ foreach Adam | ✅ | ✅ |
+| Weight tying | ✅ `data_ptr()` | ✅ | ✅ |
+| Kernel fusion | ❌ | ✅ 近似 | ✅ 精确 |
+| 执行顺序优化 | ❌ | ✅ 贪心 | ✅ Scheduler |
+
+### 13.2 未建模（贡献残余 MRE）
+
+| 因素 | 影响 | 备注 |
+|------|------|------|
+| CUDA context / driver 内存 | 16-19 MB 固定偏移 | 放大模型后 <0.1% |
+| Allocator 碎片 | reserved >> allocated | L3 不建模 reserved |
+| Kernel 临时 buffer | cuBLAS workspace 等 | 通常 <1% |
+| dark memory | ~16-19 MB | 见下 |
+
+### 13.3 dark memory 量化
 
 ```
 runtime_base - formula_base = 16-19 MB
 ```
 
-这是 CUDA context + 模型内部 buffer（如 BatchNorm running stats）+ allocator metadata。
-对于小模型（~30M params）约 7-10% 峰值，对于大模型（~7B params）< 0.1%（可忽略）。
+CUDA context + allocator metadata + 模型内部 buffer。
+小模型（~30M params）约 7-10% 峰值；放大版模型（~870M params）<0.1%，可忽略。
 
 ---
 
-## 十二、完整调用链
+## 十四、完整调用链
 
 ```
-# ====== 图捕获阶段 ======
-model = LlamaForCausalLM(config)
-capture_graphs(model, input_ids, loss_fn,
-               partition_fn=min_cut_partition)
-    │
-    ├── torch.compile(model, backend=_backend)
-    │     └── aot_module_simplified(partition_fn=min_cut_partition)
-    │           ├── joint graph 生成
-    │           ├── min_cut_rematerialization_partition()
-    │           │     └── choose_saved_values_set(budget)
-    │           └── _extract_fwd_bwd_modules()
-    │                 ├── fw_gm: output = 用户输出 + saved_acts
-    │                 └── bw_gm: placeholder = saved_acts + tangents
-    │
-    └── return fw_gm, bw_gm
+# ====== AOT 图捕获 (L2) ======
+capture_graphs(model, input_ids, loss_fn, partition_fn=min_cut)
+    → (fw_gm, bw_gm)
 
-# ====== L2 仿真阶段 ======
-estimate_training_peak(fw_gm, bw_gm, model, optimizer_cls=SGD)
-    │
-    ├── count_unique_params(model) → param_bytes
-    ├── estimate_graph_peak(fw_gm, pin_output_inputs=True)
-    │     ├── 遍历 FW 节点
-    │     │   ├── is_view_node? → skip (不分配)
-    │     │   ├── val_bytes() + 512B 对齐 → node_size
-    │     │   └── 分配/释放模拟 → fw_graph_peak
-    │     └── saved activations pinned (不释放)
-    │
-    ├── estimate_graph_peak(bw_gm, pin_output_inputs=True)
-    │     ├── BW placeholder = saved acts (作为输入"分配")
-    │     ├── 遍历 BW 节点
-    │     │   ├── 梯度计算 op → 分配
-    │     │   ├── saved act 使用完 → 释放
-    │     │   ├── 梯度输出 view-base → pin (不释放)
-    │     │   └── 分配/释放模拟 → bw_graph_peak (含梯度)
-    │     └── bw_graph_peak 天然包含 saved acts + 梯度
-    │
-    └── 拼装四峰值
-          fw_peak  = param + optim + fw_graph_peak
-          bw_peak  = param + optim + bw_graph_peak  (梯度已含在图内)
-          opt_peak = param + optim + grad + opt_temp
-          true_peak = max(fw, bw, opt)
+# ====== Inductor 图捕获 (L2.5 + L3) ======
+capture_inductor_graphs(model, input_ids, loss_fn, budget=1.0)
+    → {fw_gm, bw_gm, sched_fw_peak, sched_bw_peak}
 
-# ====== 运行时验证阶段 ======
+# ====== L2 仿真 ======
+estimate_training_peak(fw_gm, bw_gm, model)
+    ├── estimate_graph_peak(fw_gm, pin_output_inputs=True)  → fw_graph_peak
+    ├── estimate_graph_peak(bw_gm, pin_output_inputs=True)  → bw_graph_peak
+    └── 四峰值拼装 → {fw_peak, bw_peak, opt_peak, true_peak, peak_phase}
+
+# ====== L2 + L2.5 + L3 三层仿真 ======
+estimate_inductor_training_peak(capture_result, model)
+    ├── L2: estimate_training_peak(fw_gm, bw_gm, model)
+    ├── L2.5: estimate_graph_peak(fw_gm, fusion_aware=True) + min(sched_bw, fusion_bw)
+    ├── L3: static_base + sched_peaks
+    └── → {l2_*, l25_*, l3_*}
+
+# ====== 运行时验证 ======
 measure_phased(forward_fn, optimizer)
-    │
-    ├── warmup + repeats
-    │     ├── reset_peak → forward → fw_peak
-    │     ├── reset_peak → backward → bw_peak
-    │     └── reset_peak → optimizer.step → opt_peak
-    │
-    └── IQR mean 聚合 → PhaseResult
+    → PhaseResult {fw_peak, bw_peak, opt_peak, peak_phase, ...}
 
-validate(static_result, runtime_result) → MRE ≈ 7%  (详见 11-l2-accuracy-improvement.md)
+validate(static_result, runtime_result)
+    → ValidationResult {mre, direction, ...}
 ```
 
 ---
 
-## 十三、源码文件索引
+## 十五、源码文件索引
 
-| 文件 | 内容 | 行数 |
-|------|------|------|
-| `toolkit/simulation/config_estimator.py` | L1 配置公式法 | 127 行 |
-| `toolkit/simulation/graph_estimator.py` | L2 FX 图事件驱动 | 180 行 |
-| `toolkit/utils/view_ops.py` | View 检测（`_cdata` storage aliasing） | 38 行 |
-| `toolkit/utils/tensor_utils.py` | `val_bytes()` + `count_unique_params()` | 44 行 |
-| `toolkit/capture/aot_capture.py` | FW/BW 图捕获 | 65 行 |
-| `toolkit/capture/analysis.py` | 图分析（node stats, output bytes） | 95 行 |
-| `toolkit/profiler/step_profiler.py` | `measure_step()` + `measure_phased()` | 201 行 |
-| `toolkit/profiler/validator.py` | `validate()` + `analyze_error_sources()` | 97 行 |
-| `toolkit/profiler/snapshot.py` | CUDA Memory Snapshot 导出 | 26 行 |
+| 文件 | 内容 |
+|------|------|
+| `toolkit/simulation/config_estimator.py` | L1 配置公式法 (`estimate_from_config`) |
+| `toolkit/simulation/graph_estimator.py` | L2/L2.5/L3 仿真引擎 (`estimate_graph_peak`, `estimate_training_peak`, `estimate_inductor_training_peak`) |
+| `toolkit/simulation/fusion_groups.py` | L2.5 融合组识别 (`identify_fusion_groups`) |
+| `toolkit/simulation/fusion_ops.py` | L2.5 算子分类 (`EXTERN_OPS`, `is_fusable_op`) |
+| `toolkit/utils/view_ops.py` | View 检测（`_cdata` storage aliasing） |
+| `toolkit/utils/tensor_utils.py` | `val_bytes()` + `count_unique_params()` |
+| `toolkit/capture/aot_capture.py` | AOT FW/BW 图捕获 |
+| `toolkit/capture/inductor_capture.py` | Inductor 双层捕获 + L3 Scheduler hook |
+| `toolkit/capture/analysis.py` | 图分析（node stats, output bytes） |
+| `toolkit/profiler/step_profiler.py` | `measure_step()` + `measure_phased()` |
+| `toolkit/profiler/validator.py` | `validate()` + `analyze_error_sources()` |
 
 ---
 
 ## 参考
 
-- `01-architecture.md` §七：L1/L2 仿真概述
-- `03-experiments.md`：MRE 6.9% 实验数据
+- `01-architecture.md` §七：四层仿真概述
+- `13-l2.5-fusion-aware-design.md`：L2.5 融合感知设计详解
+- `12-inductor-memory-analysis.md`：Inductor 后端内存分析 + L3 可行性
+- `15-experiment-outputs.md`：实验数据说明（ex_sim_accuracy.csv 含 L2/L2.5/L3 MRE）
 - `04-dev-log.md`：Bug B2（saved_act 双重计算）修复记录
 - PyTorch: `torch.cuda.memory_stats()` — CUDACachingAllocator 统计接口

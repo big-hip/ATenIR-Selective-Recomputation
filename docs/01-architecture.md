@@ -1,7 +1,7 @@
 # 01 — 架构设计与技术决策
 
-> **文档定位**: 项目架构全景——四支柱闭环、五种策略、核心 API、仿真细节、设计原则。
-> 合并自: `.windsurf/plans/02-architecture-99269f.md` + `.windsurf/plans/11-consolidated-技术路线.md`
+> **文档定位**: 项目架构全景——四支柱闭环、五种策略、四层仿真、核心 API、设计原则。
+> 论文对应: 第 2 章 系统设计
 
 ---
 
@@ -15,30 +15,30 @@
                    │ 变换后的模型
                    ▼
             ┌──────────────┐
-            │  Pillar 2    │  capture/: AOT compile → FW/BW GraphModule
-            │  图捕获层     │  models/: 多模型注册 + 离线创建
+            │  Pillar 2    │  capture/: AOT + Inductor 双层捕获
+            │  图捕获层     │  models/: GPT-2 / LLaMA / Mistral 离线创建
             └──────┬───────┘
-                   │ FX 图 + FakeTensor meta
+                   │ FX 图 + FakeTensor meta + Scheduler peak
                    ▼
             ┌──────────────┐
-            │  Pillar 3    │  simulation/: L1 公式 → L2 事件驱动
-            │  仿真引擎     │  (L3 BFC / L4 CPU Replay → 未来)
+            │  Pillar 3    │  simulation/: L1 公式 → L2 图遍历 → L2.5 融合感知 → L3 Scheduler
+            │  仿真引擎     │
             └──────┬───────┘
                    │ 估算结果
                    ▼
             ┌──────────────┐
             │  Pillar 4    │  profiler/: GPU 运行时 ground truth
-            │  验证层       │  output/: 表格 + 图表 + 导出
-            └──────────────┘  web/: Gradio UI (可选)
+            │  验证层       │  output/: 表格 + 图表 + CSV + 论文图表(F1-F7)
+            └──────────────┘
 ```
 
 核心价值：**不需要真正跑完训练，就能估算不同重计算策略下的峰值显存**。
 
 | 维度 | 选择 | 依据 |
 |------|------|------|
-| 图捕获 | `torch.compile` + `aot_module_simplified` | PyTorch 2.x 官方方向，与 TorchTitan 一致 |
-| 仿真精度 | L2 事件驱动（FX 图遍历 + 512B 对齐） | MRE **6.9%** (B10修后, compiled 口径) |
-| 运行时基线 | **仅 compiled**（不用 eager） | 图仿真天然对标 AOT compiled 执行路径 |
+| 图捕获 | AOT (`aot_module_simplified`) + Inductor (`compile_fx` hook) | PyTorch 2.x 官方方向，双层覆盖 |
+| 仿真精度 | L2 图遍历 + L2.5 融合感知 + L3 Scheduler | aot_eager MRE 1-7%, inductor L3 MRE 5-7% |
+| 运行时基线 | compiled（eager 仅做用户级对比） | 图仿真天然对标 AOT compiled 执行路径 |
 | 首批模型 | GPT-2 + LLaMA + Mistral | 0 graph break，覆盖 learned pos / RoPE / GQA |
 | 聚合方式 | IQR mean | 两次运行 diff=0.00%，消除异常值 |
 
@@ -83,43 +83,45 @@ ATenIR-Selective-Recomputation/
 ├── toolkit/                     # ★ 核心框架
 │   ├── __init__.py              # __version__ = "0.1.0"
 │   ├── models/                  # 多模型支持
-│   │   ├── registry.py          # ModelSpec + SMALL_PRESETS + BLOCK_CLASS_MAP
-│   │   └── adapters.py          # get_hidden / get_num_layers / get_num_heads / get_intermediate
-│   ├── capture/                 # 图捕获
-│   │   ├── aot_capture.py       # capture_graphs(model, ids, loss_fn, model_kwargs=...)
-│   │   ├── analysis.py          # graph_stats / analyze_graph / count_fw_outputs
-│   │   └── inductor_capture.py  # capture_inductor_graphs() — L3 Scheduler hook
+│   │   ├── registry.py          # ModelSpec + ModelRegistry
+│   │   └── adapters.py          # get_hidden / get_num_layers / get_num_heads / ...
+│   ├── capture/                 # 图捕获（双层）
+│   │   ├── aot_capture.py       # capture_graphs() — AOT 路径 FW/BW 图
+│   │   ├── inductor_capture.py  # capture_inductor_graphs() — Inductor post-grad + L3 Scheduler
+│   │   └── analysis.py          # graph_stats / count_fw_outputs / count_fw_output_bytes
+│   ├── simulation/              # 静态仿真引擎（四层）
+│   │   ├── config_estimator.py  # L1: 公式法 (estimate_from_config)
+│   │   ├── graph_estimator.py   # L2: 图遍历 (estimate_graph_peak, estimate_training_peak)
+│   │   │                        # L2.5+L3: 三层封装 (estimate_inductor_training_peak)
+│   │   ├── fusion_groups.py     # L2.5: 融合组识别 (identify_fusion_groups)
+│   │   └── fusion_ops.py        # L2.5: 算子分类 (EXTERN_OPS, is_fusable_op)
 │   ├── strategy/                # 重计算策略
 │   │   ├── classic_ac.py        # wrap_with_checkpoint / unwrap_checkpoint
 │   │   ├── sac.py               # SAC_POLICIES + wrap_with_sac
 │   │   ├── partition.py         # get_partition_fn(default|min_cut)
-│   │   └── memory_budget.py     # Budget API wrapper (try/except 降级)
-│   ├── simulation/              # 静态仿真引擎
-│   │   ├── config_estimator.py  # L1: 公式推导 (per-model, 含 fused_optimizer)
-│   │   └── graph_estimator.py   # L2: 事件驱动 + storage aliasing + 512B align
+│   │   └── memory_budget.py     # set_memory_budget / clear_memory_budget
 │   ├── profiler/                # 运行时分析 + 验证
-│   │   ├── step_profiler.py     # StepResult + PhaseResult + measure_step/measure_phased
-│   │   ├── snapshot.py          # Memory Snapshot (.pickle)
-│   │   ├── timeline.py          # Chrome Trace + Memory Timeline
-│   │   └── validator.py         # MRE 计算 + 分阶段 MRE + 误差来源分析
+│   │   ├── step_profiler.py     # StepResult + PhaseResult + measure_step + measure_phased
+│   │   └── validator.py         # validate() + analyze_error_sources()
 │   ├── output/                  # 输出层
-│   │   ├── console.py           # tabulate 表格 (key-based 字节格式化)
-│   │   ├── charts.py            # matplotlib 图表 (bar/stacked/heatmap)
-│   │   └── export.py            # JSON / CSV / HTML 导出
-│   ├── web/                     # Gradio UI
-│   │   ├── app.py               # Blocks 主入口 (gr.State 全局配置)
-│   │   ├── helpers.py           # format_result_bytes / build_model / validate
-│   │   └── pages/               # 5 Tab 功能页面
+│   │   ├── console.py           # tabulate 表格 (print_comparison_table, ...)
+│   │   ├── charts.py            # matplotlib 交互图表 (7 种)
+│   │   ├── export.py            # to_csv / to_json
+│   │   ├── pub_charts.py        # 论文图表 (F1-F7: plot_f1..plot_f7)
+│   │   └── pub_style.py         # paper_style + savefig_pub
 │   └── utils/                   # 共享工具
 │       ├── view_ops.py          # is_view_node() — storage aliasing via _cdata
 │       ├── tensor_utils.py      # val_bytes() — hint_int + tuple 递归
-│       └── formatting.py        # fmt() / format_bytes() / normalize_row()
-├── toolkit_examples/            # 端到端示例
-│   ├── ex1_multi_model_capture.py
-│   ├── ex2_strategy_comparison.py
-│   └── ex3_simulation_accuracy.py
-├── tests/                       # 106 tests (Phase 10.0 后全部通过)
-└── docs/                        # 本文档集
+│       ├── formatting.py        # format_bytes() / normalize_row()
+│       └── env.py               # setup_experiment_env() — TF32 + 警告过滤
+├── toolkit_examples/            # 论文实验脚本
+│   ├── ex1_multi_model_capture.py     # Demo
+│   ├── ex_sim_accuracy.py             # 实验 1: 12 策略仿真精度
+│   ├── ex_peak_phase.py               # 实验 2: batch×optimizer 峰值阶段
+│   ├── ex_model_generalization.py     # 实验 3: 多模型通用性
+│   └── generate_paper_figures.py      # 论文图表 F1-F7
+├── tests/                       # 10 文件, 83 tests
+└── docs/                        # 本文档集 (16 篇)
 ```
 
 ---
@@ -167,22 +169,50 @@ def capture_graphs(
                              model_kwargs={"labels": ids})"""
 ```
 
-### 5.3 `simulation/`
+### 5.3 `capture/inductor_capture.py`
+
+```python
+def capture_inductor_graphs(
+    model: nn.Module,
+    sample_input_ids: torch.Tensor,
+    loss_fn: Callable,
+    *,
+    model_kwargs: dict | None = None,
+    dynamic: bool = True,
+    budget: float | None = None,
+) -> dict:
+    """→ {fw_gm, bw_gm, sched_fw_peak, sched_bw_peak}
+    通过 compile_fx(inner_compile=hook) 截获 post-grad FW/BW GraphModule，
+    并 monkey-patch Scheduler.__init__ 调用 estimate_peak_memory 获取 L3 峰值。"""
+```
+
+### 5.4 `simulation/`
 
 ```python
 # config_estimator.py — Level 1
 def estimate_from_config(
     config, batch, seq, dtype=torch.float32,
     optimizer="adam", fused_optimizer=False,
-) -> dict:  # → fw_peak, bw_peak, opt_peak, fwbw_peak, true_peak, peak_phase, ...
+) -> dict  # → fw_peak, bw_peak, opt_peak, fwbw_peak, true_peak, peak_phase, ...
 
 # graph_estimator.py — Level 2
-def estimate_graph_peak(gm, pin_output_inputs=False, align=512) -> dict
+def estimate_graph_peak(
+    gm, pin_output_inputs=False, align=512,
+    fusion_aware=False,     # L2.5: 识别融合组，消除内部中间张量
+    optimize_order=False,   # L2.5+: 贪心调度，最小化峰值
+) -> dict
+
 def estimate_training_peak(fw_gm, bw_gm, model, optimizer_cls=Adam,
-                           fused_optimizer=False) -> dict
+                           fused_optimizer=False) -> dict  # L2 完整训练步估算
+
+def estimate_inductor_training_peak(
+    capture_result: dict, model, optimizer_cls=Adam, fused_optimizer=False,
+) -> dict  # L2 + L2.5 + L3 三层估算
+
+def make_level_stub(est: dict, prefix: str) -> dict | None  # 提取 L2.5/L3 子结果用于 validate()
 ```
 
-### 5.4 `profiler/`
+### 5.5 `profiler/`
 
 ```python
 @dataclass
@@ -199,9 +229,11 @@ class StepResult:
 class PhaseResult:
     name: str
     fw_peak: int; bw_peak: int; opt_peak: int
-    overall_peak: int        # max(fw, bw, opt)
-    base_allocated: int
+    after_fw: int; after_bw: int; after_opt: int
+    base_allocated: int; overall_peak: int
+    activation_delta: int
     fw_ms: float; bw_ms: float; opt_ms: float; step_ms: float
+    bw_fw_delta: int; fwbw_peak: int; peak_phase: str
 
 def measure_step(name, forward_fn, optimizer, *, repeats=6, warmup=2) -> StepResult
 def measure_phased(name, forward_fn, optimizer, *, repeats=5, warmup=3) -> PhaseResult
@@ -216,7 +248,7 @@ class ValidationResult:
 def validate(static_result, runtime_result, run_mode="compiled") -> ValidationResult
 ```
 
-### 5.5 `strategy/`
+### 5.6 `strategy/`
 
 ```python
 def wrap_with_checkpoint(model, block_class_name, use_reentrant=False) -> nn.Module
@@ -260,8 +292,7 @@ measure_step/measure_phased("run", forward_fn, optimizer)  → StepResult/PhaseR
 validate(static_result, runtime_result, run_mode="compiled")  → ValidationResult
     │
     ▼
-output/: console table + charts + JSON/CSV/HTML
-web/: Gradio UI (optional)
+output/: console table + charts + CSV + 论文图表 (F1-F7)
 ```
 
 > **loss_fn 贯穿路径**: ModelSpec → capture_graphs → measure_step → validate。
@@ -302,11 +333,35 @@ L2 的输入是 `fw_gm` / `bw_gm` 两张带 `meta['val']` 的 FX 图，算法流
    true_peak = max(fw_peak, bw_peak, opt_peak)
    ```
 
-### 7.3 L2 为什么能比较准，但还不是 L3/L4
+### 7.3 L2.5 融合感知仿真
 
-- **已覆盖**：op 级 activation 生命周期、view aliasing、SymInt、512B 对齐
-- **尚未覆盖**：segment 粒度、碎片化、best-fit 复用、实际调度顺序、reserved memory 的缓存效应
-- 当前结果应理解为**高精度 L2**，而不是 allocator 级 L3/L4
+Inductor 后端会将连续的 pointwise/reduction 算子融合成单个 Triton kernel，内部中间张量不需要在 GPU 全局内存中物化。L2.5 通过以下方式近似这一行为：
+
+1. **算子分类** (`fusion_ops.py`): 区分 extern ops (mm/bmm/sdpa → CUBLAS/cuDNN) 和 fusable ops (pointwise/reduction)
+2. **融合组识别** (`fusion_groups.py`): 贪心拓扑扫描，将连续 fusable ops 合并为组
+3. **内部消除**: 融合组内部中间节点的分配设为 0
+4. **调度优化** (`optimize_order=True`): 贪心调度最小化峰值活跃内存
+
+### 7.4 L3 Scheduler 仿真
+
+L3 直接复用 Inductor 的 `Scheduler.estimate_peak_memory()` 方法：
+
+1. `capture_inductor_graphs()` 通过 monkey-patch `Scheduler.__init__` 捕获 FW/BW 的 `estimate_peak_memory` 返回值
+2. `sched_fw_peak` / `sched_bw_peak` 代表 Scheduler 视角下的激活峰值
+3. 加上 `static_base`（param + optim state）即得 L3 绝对峰值
+
+L2.5 的 BW 估算采用 `min(sched_bw, bw_fusion_aware)` 取更紧的值。
+
+### 7.5 各层覆盖范围
+
+| 特性 | L1 | L2 | L2.5 | L3 |
+|------|----|----|------|----|
+| 参数/梯度/优化器状态 | ✅ 公式 | ✅ 公式 | ✅ 公式 | ✅ 公式 |
+| 激活生命周期 | ❌ | ✅ 图遍历 | ✅ 图遍历 | ✅ Scheduler |
+| View aliasing | ❌ | ✅ _cdata | ✅ _cdata | ✅ Scheduler |
+| 512B 对齐 | ❌ | ✅ | ✅ | ✅ |
+| Fusion 消除 | ❌ | ❌ | ✅ 近似 | ✅ 精确 |
+| 执行顺序优化 | ❌ | ❌ | ✅ 贪心 | ✅ Scheduler |
 
 ### 7.4 动态侧验证：compiled ground truth
 
@@ -322,14 +377,17 @@ L2 的输入是 `fw_gm` / `bw_gm` 两张带 `meta['val']` 的 FX 图，算法流
 8. 静态-动态对齐：`validate()` 计算 MRE 并分析误差来源
 9. 辅助观测：通过 `torch.cuda.memory_stats()` 观察 allocator 行为
 
-### 7.5 仿真精度路线图
+### 7.6 仿真精度实测
 
-| Level | 方法 | 预期 MRE | 实测 MRE | 对标 |
-|-------|------|---------|---------|------|
-| **L1** | Config 公式推导 | ~20-30% | 44.7%→B12修后降低 | DNNMem |
-| **L2** | FX 图事件驱动 + 512B | ~10-15% | **6.9%** (B10修后) | Inductor |
-| L3 | + BFC Simulator | ~5-8% | 待实现 | LLMem |
-| L4 | CPU 执行 + BFC 重放 | ~3-5% | 待实现 | xMem |
+| Level | 方法 | aot_eager MRE | inductor MRE | 对标工具 |
+|-------|------|-------------|-------------|----------|
+| **L1** | Config 公式推导 | 15-25% | — | DNNMem |
+| **L2** | FX 图遍历 + 512B | **1-7%** | 28-38% (不建模 fusion) | — |
+| **L2.5** | + 融合感知 | — | **8-12%** | — |
+| **L3** | + Scheduler hook | — | **5-7%** | Inductor 内部 |
+
+> L2 在 aot_eager 后端已达到极高精度；inductor 后端需要 L2.5/L3 才能达到可用精度。
+> 详见 `15-experiment-outputs.md` 和 `ex_sim_accuracy.csv`。
 
 ---
 
@@ -396,27 +454,7 @@ L2 的输入是 `fw_gm` / `bw_gm` 两张带 `meta['val']` 的 FX 图，算法流
 
 ---
 
-## 十、Web UI 设计
-
-### v1 现状（Phase 9+10.0，已完成）
-
-| Tab | 功能 | 输出 |
-|-----|------|------|
-| 模型选择 | 选择模型 + 参数配置（gr.State 全局共享） | 模型摘要 |
-| 图捕获 | partition_fn → FW/BW 图 | IR (gr.Code) + graph_stats 表 |
-| 策略对比 | 多选策略 → 对比 | 对比表 + 柱状图 (含 vs_baseline %) |
-| 仿真分析 | L1/L2 + MRE | 统一对比表 + 分解堆叠图 |
-| 运行时 | GPU profiling | 垂直 key-value 表 |
-
-Phase 10.0 已修复核心问题：Tab 间配置共享（B1）、字节格式化（W3）、NaN 消除（W4）、MRE 百分比（W5）等。
-
-### v2 方向（Phase 11，已暂停）
-
-重点增加实验扫描 Tab 和 LaTeX/SVG 导出，面向论文答辩展示。
-
----
-
-## 十一、Phase 1-6 验证数据汇总
+## 十、Phase 1-7 验证数据汇总
 
 | Phase | 模块 | 核心结论 | 详细报告 |
 |-------|------|---------|---------|
@@ -425,31 +463,21 @@ Phase 10.0 已修复核心问题：Tab 间配置共享（B1）、字节格式化
 | **3** | capture/ | 3 模型 AOT capture，CE vs sum 30.6% | 见 04-dev-log |
 | **4** | simulation/ | L2 MRE=2.2%(eager)→6.6%(compiled)→**6.9%**(B10修后) | 见 04-dev-log |
 | **5** | strategy/ | AC -12~25%, min_cut -12~20%, MRE 7.5% | 见 04-dev-log |
-| **6** | profiler/ | 5 组件全通过, L2 vs compiled MRE 6.6% | 见 04-dev-log |
+| **6** | profiler/ | `measure_phased` + `validate` + `analyze_error_sources` | 见 04-dev-log |
+| **7** | output/ | console + charts + export + pub_charts (F1-F7) + pub_style | 见 04-dev-log |
 
-### MRE 数据（B10 修复后，L2 vs compiled runtime）
-
-| 模型 | L2 Peak | Runtime | MRE | 方向 |
-|------|---------|---------|-----|------|
-| GPT-2 | 208.5 MB | 224.0 MB | **6.9%** | under |
-| LLaMA | 201.8 MB | 188.7 MB | **6.9%** | over |
-| Mistral | 201.0 MB | 188.1 MB | **6.9%** | over |
-
-> GPT-2 方向为 under（dark memory 16-19 MB）；LLaMA/Mistral 方向为 over。
-> 对大模型 (7B+) dark memory <0.1%，可忽略。
+> 详细实验数据见 `docs/15-experiment-outputs.md` 和 `toolkit_examples/outputs/` 下的 CSV 文件。
 
 ---
 
-## 十二、风险表
+## 十一、风险表
 
 | 风险 | 级别 | 缓解 | 状态 |
 |------|------|------|------|
-| `loss_fn` 签名/labels 注入错位 | P0 | 统一为 `(model_output)->scalar`；CE loss 通过 model_kwargs 注入 labels | ✅ B10 已修 |
+| `loss_fn` 签名/labels 注入错位 | P0 | 统一为 `(model_output)->scalar`；CE loss 通过 model_kwargs 注入 labels | ✅ 已修 |
 | capture 与 profiler 训练路径不一致 | P0 | 统一 model.train()、策略、compiled/dynamic、loss 语义 | ✅ |
-| Web UI Tab2-5 忽略 Tab1 配置 | P0 | gr.State 全局配置 | ✅ B1 已修 |
-| min_cut 对比基线错误 | P0 | Phase A 增加 compiled_default | ⬜ Phase A |
 | L1 MLP 公式缺 gate_proj | P1 | 分模型类型 2/3 投影 | ✅ B12 已修 |
 | `_cdata` 未来变化 | 低 | 封装在 `is_view_node()` | 未变 |
-| SAC eager overhead | 中 | 需 Dynamo 路径 | P5 确认 |
-| dark_base 16-19 MB gap | 低 | 论文中说明 L2 是 lower bound；大模型 <0.1% | 已量化 |
-| Gradio 3.24 + pydantic v2 | 高 | app.py PredictBody 补丁 | ✅ 已修复 |
+| SAC eager overhead | 中 | 需 Dynamo 路径 | 已确认 |
+| dark_base 16-19 MB gap | 低 | L2 为 lower bound；放大模型后 <0.1% | 已量化 |
+| L2 inductor 高 MRE (28-38%) | 中 | L2.5 (8-12%) 和 L3 (5-7%) 已解决 | ✅ |

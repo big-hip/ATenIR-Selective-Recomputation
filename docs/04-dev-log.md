@@ -1,7 +1,10 @@
 # 04 — 开发日志与 Bug 追踪
 
 > **文档定位**: 完整开发记录——Phase 1-10 实施过程、Bug 清单(B1-B16/W1-W23)、验证数据。
-> 合并自: `.windsurf/plans/03-implementation-99269f.md` + `.windsurf/plans/01-bugs-and-findings-99269f.md` + 各 Phase 验证报告
+> 合并自: `.windsurf/plans/` 系列计划文件 + 各 Phase 验证报告
+>
+> **论文对应**: 第 2 章附录（开发日志参考）
+> **注意**: Phase 9 Web UI 已废弃，不纳入论文。Phase 11+ 仅作历史参考。
 
 ---
 
@@ -17,11 +20,11 @@
 | **6** | `profiler/` — 运行时分析 | P1 | ✅ | ✅ 5 组件验证, L2 MRE 6.6% |
 | **7** | `output/` — 输出层 | P1 | ❌ | ✅ console/charts/export |
 | **8** | examples — 端到端示例 | P2 | ✅ | ✅ ex1/ex2/ex3 |
-| **9** | `web/` — Gradio UI v1 | P2 | ✅ | ✅ 23 tests + 6 HTTP API |
-| **10.0** | Bug 修复 B1-B16 + 输出重构 | P0 | ✅ | ✅ 106 tests 全通过 |
-| **10.1** | 策略对比修正 | P0 | ✅ | ⬜ 待实施 |
-| **11** | Web UI v2 重构 | P2 | ✅ | ⬜ 暂停 |
-| **12** | 论文数据收集 | P1 | ✅ | ⬜ 待实施 |
+| **9** | `web/` — Gradio UI v1 | P2 | ✅ | ✅ 已废弃，不纳入论文 |
+| **10.0** | Bug 修复 B1-B16 + 输出重构 | P0 | ✅ | ✅ 83 tests 全通过 |
+| **10.1** | 策略对比修正 | P0 | ✅ | ✅ 已完成 |
+| **11** | Web UI v2 重构 | P2 | ✅ | ⬜ 已取消 |
+| **12** | 论文数据收集 | P1 | ✅ | ✅ 3 组实验 + F1-F7 图表 |
 
 ---
 

@@ -1,11 +1,15 @@
 # 03 — Min-Cut Rematerialization 效果分析报告
 
-> **文档定位**: 项目核心实验报告，所有策略设计和后续实验的数据基础。
-> 原始文件: `docs/research-mincut-analysis.md`
+> **文档定位**: 早期研究报告，分析 min-cut 策略在不同后端、优化器、batch size 下的表现，
+> 以及峰值出现阶段的深入分析。本文的结论直接影响了后续三组正式实验的设计。
 >
-> 实验日期：2025-04-15
-> 环境：PyTorch 2.6.0 + CUDA 12.4, conda env torch2.6-gpu
-> 模型：LLaMA / GPT-2 (多种尺寸), batch=2
+> **论文对应**: 第 3 章 §3.1 实验设计背景
+> **当前正式实验脚本**: `ex_sim_accuracy.py`, `ex_peak_phase.py`, `ex_model_generalization.py`
+> **详细实验输出说明**: 见 `15-experiment-outputs.md`
+>
+> *原始实验日期*: 2025-04-15
+> *环境*: PyTorch 2.6.0 + CUDA 12.4, conda env torch2.6-gpu
+> *模型*: LLaMA / GPT-2 (多种尺寸), batch=2
 
 ---
 
@@ -467,16 +471,15 @@ opt_peak 大幅降低，AC 的 52% 节省可完整体现在 true_peak 上。
 
 1. Chillee (Horace He), "Min-cut optimal(*) recomputation with AOTAutograd",
    PyTorch Dev Discuss, 2022.
-   https://dev-discuss.pytorch.org/t/min-cut-optimal-recomputation-i-e-activation-checkpointing-with-aotautograd/467
-
 2. PyTorch Blog, "Current and New Activation Checkpointing Techniques in PyTorch", 2024.
-   https://pytorch.org/blog/activation-checkpointing-techniques/
+3. PyTorch Source: `torch/_functorch/partitioners.py` (v2.6.0)
+4. PyTorch Source: `torch/_functorch/config.py`
 
-3. PyTorch Source: torch/_functorch/partitioners.py (v2.6.0)
-   - min_cut_rematerialization_partition (L1703-1912)
-   - choose_saved_values_set (L1466-1705)
-   - solve_min_cut (L815-1053)
-   - get_default_op_list (L1220-1382)
+---
 
-4. PyTorch Source: torch/_functorch/config.py
-   - activation_memory_budget, aggressive_recomputation, ban_recompute_* 等配置项
+## 十、后续文档
+
+- `15-experiment-outputs.md` — 当前三组正式实验的 CSV/图表输出说明
+- `08-static-simulation-deep-dive.md` — L1/L2/L2.5/L3 仿真引擎深度解析
+- `12-inductor-memory-analysis.md` — Inductor 后端内存分析与 L2.5/L3 设计
+- `01-architecture.md` — 四支柱架构与四层仿真设计

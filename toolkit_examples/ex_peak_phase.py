@@ -33,6 +33,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from toolkit.utils import setup_experiment_env, count_unique_params, format_bytes
+setup_experiment_env()
+
 from toolkit.models import ModelRegistry
 from toolkit.output import print_comparison_table, to_csv
 from toolkit.profiler import measure_phased
@@ -41,7 +44,6 @@ from toolkit.strategy import (
     set_memory_budget,
     wrap_with_checkpoint,
 )
-from toolkit.utils import count_unique_params, format_bytes
 
 DEVICE = "cuda"
 MODEL_NAME = "llama"

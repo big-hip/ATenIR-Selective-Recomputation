@@ -30,6 +30,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from toolkit.utils import setup_experiment_env, count_unique_params, format_bytes
+setup_experiment_env()
+
 from toolkit.capture import capture_graphs, capture_inductor_graphs
 from toolkit.models import ModelRegistry
 from toolkit.output import print_comparison_table, to_csv
@@ -42,7 +45,6 @@ from toolkit.strategy import (
     wrap_with_checkpoint,
     wrap_with_sac,
 )
-from toolkit.utils import count_unique_params, format_bytes
 
 DEVICE = "cuda"
 MODEL_NAME = "llama"
@@ -205,7 +207,7 @@ def main():
                 l3_stub = make_level_stub(l2, "l3")
                 if l3_stub is not None:
                     val_l3 = validate(l3_stub, rt)
-                del m_sim
+                del m_sim, cap
                 gc.collect()
                 torch.cuda.empty_cache()
 

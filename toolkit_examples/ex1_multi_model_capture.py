@@ -19,6 +19,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from toolkit.utils import setup_experiment_env
+setup_experiment_env()
+
 from toolkit.capture import capture_graphs, count_fw_output_bytes, count_fw_outputs, graph_stats
 from toolkit.models import ModelRegistry
 from toolkit.output import print_comparison_table

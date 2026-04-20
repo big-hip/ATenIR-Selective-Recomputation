@@ -1,8 +1,14 @@
-# Inductor 后端的 L2 级内存分析：可行性调研
+# 12 — Inductor 后端内存分析与 L2.5/L3 仿真设计
 
-> **作者**: Cascade (AI 辅助)  
-> **日期**: 2025-04-17  
-> **环境**: PyTorch 2.6.0 + CUDA 12.4, LLaMA (2L/512H), batch=4, seq=128, SGD
+> **文档定位**: Inductor 后端内存行为的调研与 L2.5/L3 仿真方案设计。
+> 本文先分析了 inductor 与 aot_eager 的图结构差异、融合对内存估算的影响，
+> 然后设计并实现了 L2.5 融合感知仿真 和 L3 Scheduler 仿真两种方案。
+>
+> **论文对应**: 第 2 章 §2.5、第 3 章 §3.2
+> **前置阅读**: `01-architecture.md` §七，`08-static-simulation-deep-dive.md` §十一-十二
+>
+> *原始调研日期*: 2025-04-17  
+> *环境*: PyTorch 2.6.0 + CUDA 12.4, LLaMA (2L/512H), batch=4, seq=128, SGD
 
 ---
 
@@ -395,43 +401,54 @@ def estimate_inductor_peak(fw_gm_post_grad, bw_gm_post_grad, model, **kwargs):
 
 ---
 
-## 八、结论与建议
+## 八、结论与实现状态
 
 ### 8.1 核心结论
 
 1. **inductor post-grad FX 图可以被截取**，且保留了 `meta['val']` FakeTensor，
    我们的 `estimate_graph_peak` 可以直接运行。
 
-2. **但精度很差**（MRE ~30%），根本原因是 **kernel fusion**：
-   - post-grad 图中的 pointwise 中间 tensor 在融合后不实际分配
-   - 但 Triton workspace / 编译开销又引入图中不可见的额外内存
+2. **纯 L2 精度不足**（MRE ~30%），根本原因是 **kernel fusion**：
+   post-grad 图中的 pointwise 中间 tensor 在融合后不实际分配。
 
 3. **Inductor 自身有 Scheduler 级别的 `estimate_peak_memory`**，
-   但只能在完整编译后才能使用，且 API 极不稳定。
+   可通过 monkey-patch 捕获。
 
 4. **没有现有学术工作**解决了 `torch.compile` + inductor 场景下的
-   静态内存估算问题。
+   静态内存估算问题。本项目的 L2.5/L3 是该方向的原创探索。
 
-### 8.2 当前建议
+### 8.2 实现状态
 
-对于本项目（毕设）的定位：
+基于上述调研，最终实现了两层方案：
 
-| 策略类型 | 建议方案 | 理由 |
-|---------|---------|------|
-| `aot_eager` 系列 | L2 图遍历（现有方案） | MRE ~7%，精度足够 |
-| `inductor` 系列 | **运行时实测**（方案 C） | 唯一可靠的方法 |
-| 未来扩展 | 方案 D（混合）+ 融合系数标定 | 可作为后续研究课题 |
+| 方案 | 原调研编号 | 实现状态 | 实测 MRE |
+|------|------------|----------|----------|
+| 方案 A（post-grad L2） | 方案 A | ✅ 基线对比 | 28-38% |
+| **L2.5 融合感知** | 方案 D 演化 | ✅ 已实现 | **8-12%** |
+| **L3 Scheduler hook** | 方案 B | ✅ 已实现 | **5-7%** |
+| 运行时实测 | 方案 C | ✅ 已有 | 0% (精确) |
 
-### 8.3 论文/毕设中的呈现建议
+**L2.5** 对应方案 D 的精确化版本：不使用经验系数，而是通过算子分类和融合组识别精确消除融合组内部中间张量。
 
-在论文中可以这样定位：
+**L3** 对应方案 B：通过 monkey-patch `Scheduler.__init__` 捕获 `estimate_peak_memory()` 返回值，无需直接依赖 `SchedulerNode` API，降低了维护成本。
 
-> 本工具的 L2 仿真引擎面向 **ATen 级 FX 图**（aot_eager 后端），
-> MRE 约 7%。对于 inductor 后端，由于 kernel fusion 导致
-> 图层级分析与实际执行之间存在语义鸿沟（semantic gap），
-> 目前采用运行时分阶段测量作为补充。
-> 这一语义鸿沟是 DL 编译器内存分析领域的**开放问题**，
-> 现有学术工作（DNNMem, xMem, LLMem）均未涉及编译器融合场景。
+详细实现见：
+- `toolkit/simulation/fusion_groups.py` + `fusion_ops.py` (L2.5)
+- `toolkit/capture/inductor_capture.py` (L3 捕获)
+- `toolkit/simulation/graph_estimator.py`: `estimate_inductor_training_peak()` (三层封装)
+- `08-static-simulation-deep-dive.md` §十一-十二 (深度解析)
+- `13-l2.5-fusion-aware-design.md` (L2.5 设计文档)
+
+### 8.3 论文中的呈现建议
+
+> 本工具提供四层静态仿真：
+> - L2 面向 aot_eager 后端，MRE 1-7%；
+> - L2.5 融合感知仿真面向 inductor 后端，通过算子分类和融合组识别
+>   近似消除 kernel fusion 的内存影响，MRE 8-12%；
+> - L3 复用 Inductor Scheduler 的 `estimate_peak_memory` 方法，
+>   获得编译器视角的精确融合感知峰值，MRE 5-7%。
+> 据我们所知，这是首个同时处理 PyTorch 2.x `torch.compile` + inductor
+> 融合场景下的静态内存估算工具。
 
 ---
 

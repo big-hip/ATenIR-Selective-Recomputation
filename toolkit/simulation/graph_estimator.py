@@ -135,12 +135,44 @@ def _schedule_min_peak(
     return placeholders + ordered + remaining + output_node
 
 
+def _forwarded_primal_bytes(fw_gm: fx.GraphModule, n_params: int) -> int:
+    """Count bytes of FW outputs that are forwarded model-parameter primals.
+
+    In AOTAutograd's partitioned FW graph, the first *n_params* placeholders
+    are model parameters (primals).  Some of them are passed straight through
+    (or via a view chain) to the FW output tuple so that the BW graph can use
+    them for gradient computation.  At runtime these forwarded primals share
+    storage with the model's weight tensors — they do NOT allocate new memory.
+
+    Returns the total bytes of such forwarded primals.
+    """
+    placeholders = [n for n in fw_gm.graph.nodes if n.op == "placeholder"]
+    param_phs = set(placeholders[:n_params])
+
+    output_node = next((n for n in fw_gm.graph.nodes if n.op == "output"), None)
+    if output_node is None:
+        return 0
+
+    output_args = output_node.args[0] if output_node.args else []
+
+    forwarded = 0
+    for arg in output_args:
+        if not isinstance(arg, fx.Node):
+            continue
+        # Trace through view chains to the base allocation
+        base = _find_view_base(arg)
+        if base in param_phs:
+            forwarded += val_bytes(base)
+    return int(forwarded)
+
+
 def estimate_graph_peak(
     gm: fx.GraphModule,
     pin_output_inputs: bool = False,
     align: int = 512,
     fusion_aware: bool = False,
     optimize_order: bool = False,
+    simulate_inplace: bool = False,
 ) -> dict:
     """Estimate peak activation memory from an FX graph via live-range analysis.
 
@@ -151,6 +183,11 @@ def estimate_graph_peak(
         fusion_aware: if True, identify Inductor-style fusion groups and
             zero-out allocations for intermediate tensors that would never
             be materialized in GPU global memory (L2.5 mode).
+        simulate_inplace: if True, model Inductor-style buffer reuse:
+            when a compute node's output has the same aligned size as one
+            of its inputs whose last user is this node, the output reuses
+            the input buffer (zero net allocation).  This approximates
+            Inductor's codegen ``MemoryPlanning`` pass.
 
     Returns:
         dict with peak_bytes, allocation counts, timeline, and (when
@@ -209,30 +246,66 @@ def estimate_graph_peak(
 
     current = 0
     peak = 0
+    peak_ph_alive = 0          # placeholder bytes alive when peak is reached
     n_allocs = 0
     n_placeholders = 0
     n_frees = 0
     timeline = []
     live: dict[fx.Node, int] = {}
+    ph_nodes: set[fx.Node] = set()   # track which live nodes are placeholders
 
+    n_reuses = 0
     for index, node in enumerate(nodes):
         if node in node_size:
             size = node_size[node]
-            live[node] = size
-            current += size
-            if node.op == "placeholder":
-                n_placeholders += 1
+
+            # ── In-place buffer reuse: if a dying input has the same
+            #    aligned size, recycle it instead of allocating fresh.
+            reused_from = None
+            if (simulate_inplace
+                    and size > 0
+                    and node.op in ("call_function", "call_method")):
+                for inp in node.all_input_nodes:
+                    if (inp in live
+                            and live[inp] == size
+                            and last_use.get(inp, -1) <= index
+                            and inp not in output_inputs):
+                        reused_from = inp
+                        break
+
+            if reused_from is not None:
+                # Recycle: remove old entry, add new under current node
+                live.pop(reused_from)
+                live[node] = size
+                n_reuses += 1
+                timeline.append({
+                    "index": index,
+                    "node": node.name,
+                    "event": "reuse",
+                    "bytes": size,
+                    "current": current,
+                    "peak": peak,
+                    "reused_from": reused_from.name,
+                })
             else:
-                n_allocs += 1
-            peak = max(peak, current)
-            timeline.append({
-                "index": index,
-                "node": node.name,
-                "event": "alloc",
-                "bytes": size,
-                "current": current,
-                "peak": peak,
-            })
+                live[node] = size
+                current += size
+                if node.op == "placeholder":
+                    n_placeholders += 1
+                    ph_nodes.add(node)
+                else:
+                    n_allocs += 1
+                if current > peak:
+                    peak = current
+                    peak_ph_alive = sum(live[n] for n in ph_nodes if n in live)
+                timeline.append({
+                    "index": index,
+                    "node": node.name,
+                    "event": "alloc",
+                    "bytes": size,
+                    "current": current,
+                    "peak": peak,
+                })
 
         to_free = [
             live_node
@@ -243,6 +316,7 @@ def estimate_graph_peak(
             size = live.pop(live_node)
             current -= size
             n_frees += 1
+            ph_nodes.discard(live_node)
             timeline.append({
                 "index": index,
                 "node": live_node.name,
@@ -254,11 +328,13 @@ def estimate_graph_peak(
 
     result = {
         "peak_bytes": peak,
+        "peak_ph_alive": peak_ph_alive,
         "num_alloc_nodes": n_allocs,
         "num_placeholders": n_placeholders,
         "num_view_nodes": view_count,
         "n_allocs": n_allocs,
         "n_frees": n_frees,
+        "n_reuses": n_reuses,
         "timeline": timeline,
     }
     if fusion_stats is not None:
@@ -310,8 +386,21 @@ def estimate_training_peak(
     # Note: grad_bytes are NOT added to bw_peak because gradient tensors
     # are already modelled as BW-graph output nodes (alive until graph end)
     # and their view-bases are pinned via pin_output_inputs=True.
-    fw_peak = static_base + fw_graph_peak
-    bw_peak = static_base + bw_graph_peak
+    #
+    # FIX: FW graph placeholders include model parameters already in
+    # static_base.  Subtract the placeholder bytes alive at peak (mostly
+    # params, pinned via output_inputs), capped at param_bytes.
+    #
+    # For BW: placeholders are saved activations + forwarded primals.
+    # Only forwarded primals overlap with static_base.  Use
+    # _forwarded_primal_bytes to determine how many param bytes were
+    # saved from FW → BW; cap at peak_ph_alive.
+    fw_ph_overlap = min(param_bytes, fw_result["peak_ph_alive"])
+    n_params = len(list(model.parameters())) + len(list(model.buffers()))
+    fwd_primal = _forwarded_primal_bytes(fw_gm, n_params)
+    bw_ph_overlap = min(fwd_primal, bw_result["peak_ph_alive"])
+    fw_peak = static_base + max(0, fw_graph_peak - fw_ph_overlap)
+    bw_peak = static_base + max(0, bw_graph_peak - bw_ph_overlap)
     opt_peak = static_base + grad_bytes + opt_temp
     fwbw_peak = max(fw_peak, bw_peak)
     true_peak = max(fw_peak, bw_peak, opt_peak)
@@ -324,7 +413,7 @@ def estimate_training_peak(
         peak_phase = "OPT"
 
     # Timeline sample points (for phase_timeline_chart)
-    after_fw = static_base + fw_graph_peak  # approx: live set at forward end
+    after_fw = static_base + max(0, fw_graph_peak - fw_ph_overlap)  # approx: live set at forward end
     after_bw = static_base + grad_bytes     # activations freed
     after_opt = static_base + grad_bytes    # temp freed
 
@@ -403,30 +492,41 @@ def estimate_inductor_training_peak(
     grad_bytes = l2["grad_bytes"]
     opt_temp = l2["opt_temp"]
 
-    # L2.5: fusion-aware FW + Scheduler-aware BW (hybrid estimator)
+    # L2.5: fusion-aware + in-place buffer reuse estimation
     #
-    # FW: fusion elimination removes Triton-internal intermediates → 20-25%
-    #     graph-peak reduction (proven effective).
-    # BW: pure graph analysis overestimates because the peak is dominated by
-    #     saved-activation placeholders whose lifetime is order-dependent, not
-    #     fusion-dependent.  When the Scheduler BW peak is available, use it
-    #     instead — this models Inductor's actual execution-order optimisation.
-    #     Fallback: fusion-aware graph analysis (same as L2 for BW in practice).
+    # Two complementary optimisations modelled statically:
+    #   1. Fusion elimination — Triton fused kernels never materialise
+    #      intermediate tensors in global memory (zeroed in live-range).
+    #   2. In-place buffer reuse — when a compute node's output has the
+    #      same aligned size as a dying input, the codegen can reuse the
+    #      buffer (modelled as zero-net allocation in live-range).
+    #
+    # When the Inductor Scheduler BW peak is also available, we take the
+    # tighter (lower) of the two estimates for BW, giving the best of
+    # graph-level analysis and Scheduler-level simulation.
     fw_fa = estimate_graph_peak(fw_gm, pin_output_inputs=True,
-                                fusion_aware=True)
+                                fusion_aware=True, simulate_inplace=True)
     bw_fa = estimate_graph_peak(bw_gm, pin_output_inputs=True,
-                                fusion_aware=True)
+                                fusion_aware=True, simulate_inplace=True)
 
-    l25_fw_peak = static_base + fw_fa["peak_bytes"]
+    param_bytes = l2["param_bytes"]
+    fw_fa_ph_overlap = min(param_bytes, fw_fa["peak_ph_alive"])
+    l25_fw_peak = static_base + max(0, fw_fa["peak_bytes"] - fw_fa_ph_overlap)
 
-    # BW: take the tighter (lower) of Scheduler peak vs fusion-aware graph
-    # peak.  The Scheduler can overestimate when recomputation inflates
-    # intermediate buffers (e.g. budget=0.0), so we cap at graph-level.
-    bw_fa_peak = bw_fa["peak_bytes"]
+    # BW: take the tighter (lower) of Scheduler peak vs fusion+inplace
+    # graph peak.  For b=0.0 (max recomputation), fusion+inplace is
+    # significantly tighter than the Scheduler; for b=1.0, the Scheduler
+    # is marginally tighter.  min() gives the best of both.
+    # NOTE: sched_bw does NOT include param placeholders (it comes from
+    # Inductor Scheduler codegen), so only adjust the graph-level peak.
+    n_params = len(list(model.parameters())) + len(list(model.buffers()))
+    fwd_primal = _forwarded_primal_bytes(fw_gm, n_params)
+    bw_fa_ph_overlap = min(fwd_primal, bw_fa["peak_ph_alive"])
+    bw_fi_peak = max(0, bw_fa["peak_bytes"] - bw_fa_ph_overlap)
     if sched_bw is not None:
-        l25_bw_peak = static_base + min(sched_bw, bw_fa_peak)
+        l25_bw_peak = static_base + min(sched_bw, bw_fi_peak)
     else:
-        l25_bw_peak = static_base + bw_fa_peak
+        l25_bw_peak = static_base + bw_fi_peak
 
     l25_opt_peak = static_base + grad_bytes + opt_temp
     l25_fwbw_peak = max(l25_fw_peak, l25_bw_peak)

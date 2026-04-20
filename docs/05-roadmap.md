@@ -1,7 +1,11 @@
 # 05 — 后续执行计划（Phase A/B/C）
 
-> **文档定位**: 基于 `03-experiments.md` 九章结论 + 外部审查验证，规划后续策略扩展与论文实验。
-> 原始来源: `plan.md` v4.2（2025-04-15），Phase 0 已完成部分移至 `04-dev-log.md`。
+> **文档定位**: 早期路线图，基于 `03-experiments.md` 结论规划的策略扩展与论文实验。
+> 已全部完成。当前正式实验脚本已整合为 3 个：
+> `ex_sim_accuracy.py`, `ex_peak_phase.py`, `ex_model_generalization.py`。
+>
+> **论文对应**: 第 3 章 §3.1 实验设计
+> **详细输出说明**: 见 `15-experiment-outputs.md`
 
 ---
 
@@ -178,28 +182,14 @@ Phase 0 已在 Phase 10.0 中实现，详细记录见 `04-dev-log.md`。
 
 ---
 
-## 执行状态（2025-04-19 · 全部完成）
+## 执行状态（全部完成）
 
-```
-✅ Phase 0 (四峰值贯通 + Web)
-✅ Phase A (12策略扩展)     → ex3_simulation_accuracy.py
-✅ Phase B (大 batch 验证)  → ex4_batch_scaling.py + ex8_fused_optimizer.py
-✅ Phase C (校准闭环)       → ex5 + ex6 + ex7
-```
+各 Phase 已完成。早期 ex3-ex8 脚本已整合为当前 3 个正式实验脚本：
 
-### Phase A 实际交付
+| 早期脚本 | 当前对应 | 说明 |
+|----------|----------|------|
+| ex3, ex5 | `ex_sim_accuracy.py` | 12 策略仿真精度 (L2/L2.5/L3 vs Runtime) |
+| ex4, ex8 | `ex_peak_phase.py` | batch×optimizer 峰值阶段分析 |
+| ex6, ex7 | `ex_model_generalization.py` | GPT-2/LLaMA/Mistral 跨模型验证 |
 
-- 12 策略在 `ex3_simulation_accuracy.py` 中完整实现（3 组 × 4 策略）
-- `ex5_simulation_vs_runtime.py` 扩展了 L2+L3 仿真支持
-- 图表: overview bar chart / per-group savings / Pareto scatter
-
-### Phase B 实际交付
-
-- `ex4_batch_scaling.py`: batch [1,2,4,8] × eager/ac，验证 activation_ratio → savings 关系
-- `ex8_fused_optimizer.py`: SGD/Adam/Adam(fused) × 4 策略 × 2 batch，验证 fused Adam 解锁 AC
-
-### Phase C 实际交付
-
-- `ex5`: 12 策略 L2+L3 vs Runtime，aot_eager MRE 1-2.4%，L3 MRE 5-7%
-- `ex6`: 5 策略 × 3 batch Inductor 双层，L2 avg 21.2%，L3 avg 10.7%
-- `ex7`: GPT-2/LLaMA/Mistral × 6 策略矩阵，跨模型一致性验证
+详细输出格式见 `15-experiment-outputs.md`。

@@ -29,6 +29,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from toolkit.utils import setup_experiment_env
+setup_experiment_env(enable_tf32=False)
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -40,8 +43,11 @@ from toolkit.output.pub_charts import (
     plot_f3_peak_comparison,
     plot_f4_mre,
     plot_f5_peak_phase_heatmap,
+    plot_f5_merged,
     plot_f6_phase_stack,
+    plot_f6_merged,
     plot_f7_model_heatmap,
+    plot_f7_merged,
 )
 
 DATA_DIR = Path(__file__).with_name("outputs")
@@ -174,62 +180,52 @@ def _gen_f4():
 
 # ── F5: Peak Phase Heatmap ───────────────────────────────────────
 def _gen_f5():
-    """F5: Heatmap of peak phase (batch × optimizer) for multiple strategies."""
+    """F5: Merged 2×2 heatmap of peak phase for all strategies."""
     rows = _load_csv("ex_peak_phase.csv")
     if not rows:
         return
 
-    # Generate one heatmap per strategy
-    strategies = list(dict.fromkeys(r.get("strategy", "") for r in rows))
-    for strat in strategies:
-        safe_name = strat.replace("(", "").replace(")", "").replace("=", "").replace("+", "_")
-        fig = plot_f5_peak_phase_heatmap(rows, strategy=strat)
-        savefig_pub(fig, OUT_DIR / f"F5_peak_phase_{safe_name}")
-        plt.close(fig)
-        print(f"  [OK] F5_peak_phase_{safe_name}")
+    # Merged figure (primary)
+    fig = plot_f5_merged(rows)
+    savefig_pub(fig, OUT_DIR / "F5_peak_phase_merged")
+    print("  [OK] F5_peak_phase_merged")
 
 
 # ── F6: Three-Phase Stacked Bar ──────────────────────────────────
 def _gen_f6():
-    """F6: Stacked bar of fw/bw/opt peaks per batch for each optimizer."""
+    """F6: Merged stacked bar of fw/bw/opt for eager + inductor(b=1.0)."""
     rows = _load_csv("ex_peak_phase.csv")
     if not rows:
         return
 
-    # Generate for "eager" and one compiled strategy
-    for strat in ["eager", "inductor(b=1.0)"]:
-        strat_rows = [r for r in rows if r.get("strategy") == strat]
-        if not strat_rows:
-            continue
-        safe_name = strat.replace("(", "").replace(")", "").replace("=", "").replace("+", "_")
-        fig = plot_f6_phase_stack(rows, strategy=strat)
-        savefig_pub(fig, OUT_DIR / f"F6_phase_stack_{safe_name}")
-        plt.close(fig)
-        print(f"  [OK] F6_phase_stack_{safe_name}")
+    # Merged figure (primary) — 2 representative strategies per v3
+    fig = plot_f6_merged(rows, strategies=["eager", "ac+inductor"],
+                         subtitle="LLaMA ~870M  |  S=512")
+    savefig_pub(fig, OUT_DIR / "F6_phase_stack_merged")
+    print("  [OK] F6_phase_stack_merged")
 
 
 # ── F7: Model Generalization Heatmap ─────────────────────────────
 def _gen_f7():
-    """F7: Model × Strategy MRE heatmap for L2 (and L2.5, L3 if available)."""
+    """F7: Merged 1×3 model × strategy MRE heatmap for L2/L2.5/L3."""
     rows = _load_csv("ex_model_generalization.csv")
     if not rows:
         return
 
-    for level in ["l2", "l25", "l3"]:
-        # Check if this level has data
-        mre_key = f"{level}_mre"
-        if not any(r.get(mre_key) is not None and float(r.get(mre_key, 0) or 0) > 0
-                   for r in rows):
-            continue
-        fig = plot_f7_model_heatmap(rows, level=level)
-        savefig_pub(fig, OUT_DIR / f"F7_model_heatmap_{level}")
-        plt.close(fig)
-        print(f"  [OK] F7_model_heatmap_{level}")
+    # Merged figure (primary)
+    fig = plot_f7_merged(rows,
+                         subtitle="B=8, S=512  |  Adam (fused)")
+    savefig_pub(fig, OUT_DIR / "F7_model_heatmap_merged")
+    print("  [OK] F7_model_heatmap_merged")
 
 
 # ── Main ─────────────────────────────────────────────────────────
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Clean old files to avoid stale standalone figures
+    for old in OUT_DIR.glob("*"):
+        if old.is_file():
+            old.unlink()
     print("=" * 60)
     print("  Generating publication-quality figures")
     print(f"  Output: {OUT_DIR}/")
