@@ -1,11 +1,18 @@
 # Core (PyTorch 已通过 Docker 基础镜像 / conda 安装，此处不重复指定)
 # torch >= 2.1
+#
+# 安装示例（清华源）:
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple/
+
+# 模型与配置
+transformers==4.35.2
+huggingface_hub>=0.16.4,<1.0
+tokenizers>=0.14,<0.19
 
 # 策略 7（min-cut 最优重计算）
 networkx>=3.0
 
-# 运行时内存分析（CPU 端 RSS 测量）
-psutil>=5.9
-
-# 内存分析图表
+# 输出与可视化
 matplotlib>=3.7
+pandas>=2.0
+tabulate>=0.10

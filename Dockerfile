@@ -20,11 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # ── 默认环境变量 ─────────────────────────────────────────────────────────────
-ENV RECOMPUTE='{"6": 0}' \
-    RECOMPUTE_LOG_LEVEL=INFO \
-    MODEL_NAME=Transformer \
-    PROJECT_ROOT=/workspace/ATenIR-Selective-Recomputation \
-    PYTHONPATH=/workspace/ATenIR-Selective-Recomputation
+ENV PYTHONPATH=/workspace/ATenIR-Selective-Recomputation
 
-# ── 默认入口：运行 Transformer 示例 ──────────────────────────────────────────
-CMD ["python", "examples/transformer/main.py"]
+# ── 默认入口：L1/L2 多模型对比 ────────────────────────────────────
+CMD ["python", "toolkit_examples/ex1_multi_model_capture.py"]
