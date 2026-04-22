@@ -1,18 +1,21 @@
-# Core (PyTorch 已通过 Docker 基础镜像 / conda 安装，此处不重复指定)
-# torch >= 2.1
-#
+# ─── ATenIR-Selective-Recomputation 依赖 ─────────────────────────
+
 # 安装示例（清华源）:
 #   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple/
+# PyTorch ≥ 2.6 + CUDA 12.4 — 通过 conda / Docker 基础镜像安装，不在此指定
+# 安装: pip install -r requirements.txt
 
-# 模型与配置
+# 模型
 transformers==4.35.2
 huggingface_hub>=0.16.4,<1.0
 tokenizers>=0.14,<0.19
 
-# 策略 7（min-cut 最优重计算）
+# 图算法（min-cut 分区器依赖）
 networkx>=3.0
 
 # 输出与可视化
 matplotlib>=3.7
-pandas>=2.0
-tabulate>=0.10
+tabulate>=0.9
+
+# 开发 / 测试
+pytest>=7.0

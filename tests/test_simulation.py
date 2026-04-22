@@ -8,7 +8,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 
 from toolkit.capture import capture_graphs, capture_inductor_graphs
 from toolkit.models import ModelRegistry
-from toolkit.simulation import estimate_from_config, estimate_graph_peak, estimate_inductor_training_peak, estimate_training_peak
+from toolkit.simulation import detect_recomputation, estimate_from_config, estimate_graph_peak, estimate_inductor_training_peak, estimate_training_peak
 
 
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -41,6 +41,31 @@ def test_view_nodes_excluded():
 
     assert result["num_view_nodes"] > 0
     assert result["num_alloc_nodes"] == 0
+
+
+def test_peak_net_bytes_defaults_to_peak():
+    """When overlap_bytes=0, peak_net_bytes should equal peak_bytes."""
+    def fn(x):
+        return x + 1.0
+
+    gm = _trace_fake(fn, torch.randn(4, 4))
+    result = estimate_graph_peak(gm)
+    assert "peak_net_bytes" in result
+    assert result["peak_net_bytes"] == result["peak_bytes"]
+
+
+def test_peak_net_bytes_with_overlap():
+    """When overlap_bytes > 0, peak_net_bytes <= peak_bytes."""
+    def fn(x):
+        a = x + 1.0
+        b = a * 2.0
+        return b
+
+    gm = _trace_fake(fn, torch.randn(4, 4))
+    result_no_overlap = estimate_graph_peak(gm)
+    result_with_overlap = estimate_graph_peak(gm, overlap_bytes=result_no_overlap["peak_bytes"])
+    assert result_with_overlap["peak_net_bytes"] <= result_with_overlap["peak_bytes"]
+    assert result_with_overlap["peak_bytes"] == result_no_overlap["peak_bytes"]
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires GPU")
@@ -273,7 +298,39 @@ def test_l25_between_l2_and_l3():
     l25 = r["l25_true_peak"]
     l3 = r["l3_true_peak"]
 
-    assert l25 <= l2, f"L2.5 ({l25}) should be <= L2 ({l2})"
+    assert r["l25_true_peak"] <= l2, f"L2.5 ({l25}) should be <= L2 ({l2})"
     # L3 uses Scheduler peaks (independent estimate); may be > or < L2
     assert l3 > 0, "L3 should be positive"
     assert l25 < l2, f"L2.5 ({l25}) should be strictly < L2 ({l2})"
+
+
+@requires_inductor
+def test_detect_recomputation_no_ac():
+    """detect_recomputation returns False for baseline (no AC) model."""
+    reg = ModelRegistry()
+    model = reg.create_model("gpt2").to(DEVICE).train()
+    config = reg.get_config("gpt2")
+    input_ids = torch.randint(0, config.vocab_size, (BATCH, SEQ), device=DEVICE)
+
+    cap = capture_inductor_graphs(
+        model, input_ids, lambda out: out.loss,
+        model_kwargs={"labels": input_ids},
+    )
+    assert detect_recomputation(cap["bw_gm"]) is False
+
+
+@requires_inductor
+def test_inductor_has_recomputation_field():
+    """estimate_inductor_training_peak returns has_recomputation field."""
+    reg = ModelRegistry()
+    model = reg.create_model("gpt2").to(DEVICE).train()
+    config = reg.get_config("gpt2")
+    input_ids = torch.randint(0, config.vocab_size, (BATCH, SEQ), device=DEVICE)
+
+    cap = capture_inductor_graphs(
+        model, input_ids, lambda out: out.loss,
+        model_kwargs={"labels": input_ids},
+    )
+    r = estimate_inductor_training_peak(cap, model, optimizer_cls=torch.optim.SGD)
+    assert "has_recomputation" in r
+    assert isinstance(r["has_recomputation"], bool)

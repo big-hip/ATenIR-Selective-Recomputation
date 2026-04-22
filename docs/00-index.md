@@ -26,6 +26,8 @@
 | 13 | `13-l2.5-fusion-aware-design.md` | L2.5 融合感知仿真：fusion group 识别与 internal 消除 | 第 2 章 §2.5 |
 | 14 | `14-aten-recompute-key-ideas.md` | 已删除 aten_recompute 目录关键设计存档 | 附录 |
 | 15 | `15-experiment-outputs.md` | 实验输出说明：3 个 CSV + 7 类论文图表 (F1-F7) | 第 3 章 |
+| 16 | `16-param-double-counting-fix.md` | 参数双重计数修复：`peak_ph_alive` + `_forwarded_primal_bytes`，MRE 12%→8.8% | 第 2 章 §2.4 |
+| — | `sim-optimization-plan.md` | 仿真精度优化方案：Overlap-Aware Peak + 编译器元数据重计算检测 | 第 2 章 §2.4 |
 
 ---
 
@@ -65,7 +67,7 @@
 | F6 | FW/BW/OPT 三阶段堆叠柱状图 | ex_peak_phase.csv |
 | F7 | 模型 × 策略 MRE 热力图 | ex_model_generalization.csv |
 
-### 测试: 10 个文件, 83 个 test 函数
+### 测试: 10 个文件, 85 个 test 函数
 
 ---
 
@@ -83,4 +85,5 @@
 | v6 | 2025-04-19 | Inductor 双层仿真 + L2.5 融合感知 + 全量实验 |
 | v6.1 | 2025-04-19 | 代码清理 + 审查修复：bw_peak 一致性、output 测试、stale ref 清除 |
 | v6.2 | 2025-04-20 | 脚本合并 (ex1-ex8 → 3 脚本) + 论文图表系统 (F1-F7) + TF32/警告管理 |
-| **v7** | **2025-04-20** | **文档全面整理：按代码最终状态重写 docs/ + plans/，论文可直接引用** |
+| v7 | 2025-04-20 | 文档全面整理：按代码最终状态重写 docs/ + plans/，论文可直接引用 |
+| **v7.1** | **2025-04-21** | **项目整理：README/requirements/Docker/Makefile 对齐实际代码，清理诊断脚本** |

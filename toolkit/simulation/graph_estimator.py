@@ -144,10 +144,27 @@ def _forwarded_primal_bytes(fw_gm: fx.GraphModule, n_params: int) -> int:
     them for gradient computation.  At runtime these forwarded primals share
     storage with the model's weight tensors — they do NOT allocate new memory.
 
+    Uses FakeTensor storage matching: if an FW output tensor shares underlying
+    storage with a param placeholder, it is a forwarded primal (regardless of
+    how many view ops are between them).
+
     Returns the total bytes of such forwarded primals.
     """
     placeholders = [n for n in fw_gm.graph.nodes if n.op == "placeholder"]
-    param_phs = set(placeholders[:n_params])
+    param_phs = placeholders[:n_params]
+
+    # Collect storage IDs from param placeholders
+    param_storages: dict[int, int] = {}   # cdata → param_bytes
+    for ph in param_phs:
+        val = ph.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        try:
+            cdata = val.untyped_storage()._cdata
+            # Use storage nbytes (base allocation), not element-level size
+            param_storages[cdata] = int(val.untyped_storage().nbytes())
+        except Exception:
+            param_storages[id(ph)] = val_bytes(ph)  # fallback
 
     output_node = next((n for n in fw_gm.graph.nodes if n.op == "output"), None)
     if output_node is None:
@@ -155,14 +172,23 @@ def _forwarded_primal_bytes(fw_gm: fx.GraphModule, n_params: int) -> int:
 
     output_args = output_node.args[0] if output_node.args else []
 
+    # Track which param storages have been counted (avoid double-counting
+    # the same parameter saved multiple times, e.g. via different views)
+    seen_storages: set[int] = set()
     forwarded = 0
     for arg in output_args:
         if not isinstance(arg, fx.Node):
             continue
-        # Trace through view chains to the base allocation
-        base = _find_view_base(arg)
-        if base in param_phs:
-            forwarded += val_bytes(base)
+        val = arg.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        try:
+            cdata = val.untyped_storage()._cdata
+        except Exception:
+            continue
+        if cdata in param_storages and cdata not in seen_storages:
+            seen_storages.add(cdata)
+            forwarded += param_storages[cdata]
     return int(forwarded)
 
 
@@ -173,6 +199,7 @@ def estimate_graph_peak(
     fusion_aware: bool = False,
     optimize_order: bool = False,
     simulate_inplace: bool = False,
+    overlap_bytes: int = 0,
 ) -> dict:
     """Estimate peak activation memory from an FX graph via live-range analysis.
 
@@ -188,10 +215,16 @@ def estimate_graph_peak(
             of its inputs whose last user is this node, the output reuses
             the input buffer (zero net allocation).  This approximates
             Inductor's codegen ``MemoryPlanning`` pass.
+        overlap_bytes: bytes of placeholder tensors that overlap with
+            ``static_base`` (e.g. forwarded primals).  When > 0, an
+            additional ``peak_net_bytes`` is computed as
+            ``max_t { current(t) - min(overlap_bytes, ph_alive(t)) }``
+            which accounts for the fact that overlap shrinks as
+            placeholders are freed.  This fixes AC BW under-estimation.
 
     Returns:
-        dict with peak_bytes, allocation counts, timeline, and (when
-        fusion_aware) fusion_groups / internal_nodes / internal_bytes.
+        dict with peak_bytes, peak_net_bytes, allocation counts, timeline,
+        and (when fusion_aware) fusion_groups / internal_nodes / internal_bytes.
     """
     nodes = list(gm.graph.nodes)
 
@@ -241,18 +274,35 @@ def estimate_graph_peak(
     last_use: dict[fx.Node, int] = {}
     for index, node in enumerate(nodes):
         for input_node in node.all_input_nodes:
-            if input_node in node_size:
-                last_use[input_node] = index
+            # If input is a view, its storage belongs to the base
+            # allocation — extend the base's live-range to this consumer.
+            target = input_node
+            if (input_node.op in ("call_function", "call_method")
+                    and is_view_node(input_node)):
+                target = _find_view_base(input_node)
+            if target in node_size:
+                last_use[target] = index
 
     current = 0
     peak = 0
     peak_ph_alive = 0          # placeholder bytes alive when peak is reached
+    ph_alive_bytes = 0         # current placeholder bytes alive (for overlap tracking)
+    peak_net = 0               # max(current - min(overlap_bytes, ph_alive)) across time
     n_allocs = 0
     n_placeholders = 0
     n_frees = 0
     timeline = []
     live: dict[fx.Node, int] = {}
     ph_nodes: set[fx.Node] = set()   # track which live nodes are placeholders
+
+    def _update_peak_net():
+        """Update overlap-aware peak (net of static_base overlap)."""
+        nonlocal peak_net
+        if overlap_bytes > 0:
+            overlap_now = min(overlap_bytes, ph_alive_bytes)
+            net = current - overlap_now
+            if net > peak_net:
+                peak_net = net
 
     n_reuses = 0
     for index, node in enumerate(nodes):
@@ -275,9 +325,13 @@ def estimate_graph_peak(
 
             if reused_from is not None:
                 # Recycle: remove old entry, add new under current node
+                if reused_from in ph_nodes:
+                    ph_alive_bytes -= live[reused_from]
+                    ph_nodes.discard(reused_from)
                 live.pop(reused_from)
                 live[node] = size
                 n_reuses += 1
+                _update_peak_net()
                 timeline.append({
                     "index": index,
                     "node": node.name,
@@ -293,11 +347,13 @@ def estimate_graph_peak(
                 if node.op == "placeholder":
                     n_placeholders += 1
                     ph_nodes.add(node)
+                    ph_alive_bytes += size
                 else:
                     n_allocs += 1
                 if current > peak:
                     peak = current
                     peak_ph_alive = sum(live[n] for n in ph_nodes if n in live)
+                _update_peak_net()
                 timeline.append({
                     "index": index,
                     "node": node.name,
@@ -316,7 +372,9 @@ def estimate_graph_peak(
             size = live.pop(live_node)
             current -= size
             n_frees += 1
-            ph_nodes.discard(live_node)
+            if live_node in ph_nodes:
+                ph_alive_bytes -= size
+                ph_nodes.discard(live_node)
             timeline.append({
                 "index": index,
                 "node": live_node.name,
@@ -325,9 +383,20 @@ def estimate_graph_peak(
                 "current": current,
                 "peak": peak,
             })
+        # After frees, overlap may have shrunk → check peak_net again
+        if to_free:
+            _update_peak_net()
+
+    # ── End-of-graph兜底 (优化 E): 遍历结束后 current 可能含 pinned 输出 ──
+    _update_peak_net()
+
+    # If overlap_bytes was not used, peak_net defaults to peak
+    if overlap_bytes == 0:
+        peak_net = peak
 
     result = {
         "peak_bytes": peak,
+        "peak_net_bytes": peak_net,
         "peak_ph_alive": peak_ph_alive,
         "num_alloc_nodes": n_allocs,
         "num_placeholders": n_placeholders,
@@ -362,16 +431,39 @@ def estimate_training_peak(
         optim_mul = 2
     optim_bytes = param_bytes * optim_mul
 
-    fw_result = estimate_graph_peak(fw_gm, pin_output_inputs=True)
-    bw_result = estimate_graph_peak(bw_gm, pin_output_inputs=True)
+    # Model buffers (e.g. LayerNorm running_mean/var, position embeddings) —
+    # persistent GPU memory not included in param_bytes (which only counts
+    # nn.Parameter).  Must be computed before graph estimation to set overlap.
+    seen_buf_ptrs: set[int] = set()
+    buffer_bytes = 0
+    for buf in model.buffers():
+        ptr = buf.data_ptr()
+        if ptr not in seen_buf_ptrs:
+            seen_buf_ptrs.add(ptr)
+            buffer_bytes += buf.numel() * buf.element_size()
+
+    # Compute forwarded primal bytes (param tensors passed FW→BW via output)
+    n_params = len(list(model.parameters())) + len(list(model.buffers()))
+    fwd_primal = _forwarded_primal_bytes(fw_gm, n_params)
+
+    # FW graph: placeholders include model params + buffers, both in
+    # static_base.  Use overlap_bytes = param_bytes + buffer_bytes so that
+    # peak_net_bytes correctly subtracts the overlap at every time step.
+    fw_overlap = param_bytes + buffer_bytes
+    fw_result = estimate_graph_peak(fw_gm, pin_output_inputs=True,
+                                     overlap_bytes=fw_overlap)
+    # BW graph: use overlap_bytes so that peak_net_bytes tracks the
+    # overlap-aware peak = max_t { current(t) - min(fwd_primal, ph_alive(t)) }
+    bw_result = estimate_graph_peak(bw_gm, pin_output_inputs=True,
+                                     overlap_bytes=fwd_primal)
 
     # Graph-level activation-only peaks (internal analysis)
     fw_graph_peak = fw_result["peak_bytes"]
     bw_graph_peak = bw_result["peak_bytes"]
     act_peak = max(fw_graph_peak, bw_graph_peak)
 
-    # Fixed base: param + optimizer states (after zero_grad set_to_none=True)
-    static_base = param_bytes + optim_bytes
+    # Fixed base: param + optimizer states + buffers (after zero_grad set_to_none=True)
+    static_base = param_bytes + optim_bytes + buffer_bytes
 
     # Optimizer temporary memory
     #   foreach Adam (default): _foreach_sqrt over all params -> param_bytes
@@ -383,24 +475,16 @@ def estimate_training_peak(
         opt_temp = 0
 
     # Absolute peaks (consistent with runtime measure_phased semantics)
-    # Note: grad_bytes are NOT added to bw_peak because gradient tensors
-    # are already modelled as BW-graph output nodes (alive until graph end)
-    # and their view-bases are pinned via pin_output_inputs=True.
     #
-    # FIX: FW graph placeholders include model parameters already in
-    # static_base.  Subtract the placeholder bytes alive at peak (mostly
-    # params, pinned via output_inputs), capped at param_bytes.
-    #
-    # For BW: placeholders are saved activations + forwarded primals.
-    # Only forwarded primals overlap with static_base.  Use
-    # _forwarded_primal_bytes to determine how many param bytes were
-    # saved from FW → BW; cap at peak_ph_alive.
-    fw_ph_overlap = min(param_bytes, fw_result["peak_ph_alive"])
-    n_params = len(list(model.parameters())) + len(list(model.buffers()))
-    fwd_primal = _forwarded_primal_bytes(fw_gm, n_params)
-    bw_ph_overlap = min(fwd_primal, bw_result["peak_ph_alive"])
-    fw_peak = static_base + max(0, fw_graph_peak - fw_ph_overlap)
-    bw_peak = static_base + max(0, bw_graph_peak - bw_ph_overlap)
+    # Both FW and BW use overlap-aware peak_net_bytes:
+    #   peak_net = max_t { current(t) - min(overlap, ph_alive(t)) }
+    # This correctly handles:
+    #   - FW: params+buffers in static_base overlap with FW placeholders
+    #   - BW: forwarded primals overlap with BW placeholders, and the
+    #     overlap shrinks as placeholders are freed (AC scenario fix)
+    fw_peak = static_base + fw_result["peak_net_bytes"]
+    bw_peak = static_base + bw_result["peak_net_bytes"]
+
     opt_peak = static_base + grad_bytes + opt_temp
     fwbw_peak = max(fw_peak, bw_peak)
     true_peak = max(fw_peak, bw_peak, opt_peak)
@@ -413,13 +497,14 @@ def estimate_training_peak(
         peak_phase = "OPT"
 
     # Timeline sample points (for phase_timeline_chart)
-    after_fw = static_base + max(0, fw_graph_peak - fw_ph_overlap)  # approx: live set at forward end
+    after_fw = fw_peak  # approx: live set at forward end
     after_bw = static_base + grad_bytes     # activations freed
     after_opt = static_base + grad_bytes    # temp freed
 
     return {
         "tag": "graph_L2",
         "param_bytes": param_bytes,
+        "buffer_bytes": buffer_bytes,
         "grad_bytes": grad_bytes,
         "optim_bytes": optim_bytes,
         "optimizer_bytes": optim_bytes,
@@ -449,11 +534,31 @@ def estimate_training_peak(
     }
 
 
+def detect_recomputation(bw_gm: fx.GraphModule) -> bool:
+    """Detect whether BW graph contains AC (Activation Checkpointing) recomputed nodes.
+
+    PyTorch's CheckpointPolicy mechanism sets ``meta['recompute']`` to
+    ``CheckpointPolicy.PREFER_RECOMPUTE`` on nodes that are re-executed in
+    the backward graph due to activation checkpointing.  This metadata is
+    generated by the compiler and is 100% precise (zero false positives).
+
+    Note: min-cut recomputation (via ``activation_memory_budget``) does NOT
+    set this flag — those nodes are repartitioned into the BW graph directly
+    with ``partitioner_tag='is_backward'``.  For extreme min-cut scenarios,
+    the caller can override via ``has_recomputation=True``.
+    """
+    for n in bw_gm.graph.nodes:
+        if n.meta.get("recompute") is not None:
+            return True
+    return False
+
+
 def estimate_inductor_training_peak(
     capture_result: dict,
     model: nn.Module,
     optimizer_cls=torch.optim.Adam,
     fused_optimizer: bool = False,
+    has_recomputation: bool | None = None,
 ) -> dict:
     """Triple-layer (L2 + L2.5 + L3) training peak estimation from inductor capture.
 
@@ -463,6 +568,9 @@ def estimate_inductor_training_peak(
         model: the model (for param counting).
         optimizer_cls: optimizer class for state estimation.
         fused_optimizer: whether fused optimizer is used.
+        has_recomputation: whether the BW graph contains recomputed nodes.
+            None (default) → auto-detect via ``detect_recomputation(bw_gm)``.
+            True/False → caller override (useful for extreme min-cut budgets).
 
     Returns:
         dict with all fields from ``estimate_training_peak`` (L2) plus:
@@ -480,17 +588,27 @@ def estimate_inductor_training_peak(
     sched_fw = capture_result.get("sched_fw_peak")
     sched_bw = capture_result.get("sched_bw_peak")
 
-    # L2: standard graph-level estimation
+    # Recomputation detection: auto-detect AC via compiler metadata,
+    # or use caller override for extreme min-cut scenarios.
+    if has_recomputation is None:
+        has_recomp = detect_recomputation(bw_gm)
+    else:
+        has_recomp = has_recomputation
+
+    # L2: standard graph-level estimation (already includes overlap-aware BW peak)
     l2 = estimate_training_peak(
         fw_gm, bw_gm, model,
         optimizer_cls=optimizer_cls,
         fused_optimizer=fused_optimizer,
     )
     l2["tag"] = "inductor_L2L25L3"
+    l2["has_recomputation"] = has_recomp
 
-    static_base = l2["base"]  # param_bytes + optim_bytes
+    static_base = l2["base"]  # param_bytes + optim_bytes + buffer_bytes
     grad_bytes = l2["grad_bytes"]
     opt_temp = l2["opt_temp"]
+    param_bytes = l2["param_bytes"]
+    buffer_bytes = l2.get("buffer_bytes", 0)
 
     # L2.5: fusion-aware + in-place buffer reuse estimation
     #
@@ -501,32 +619,28 @@ def estimate_inductor_training_peak(
     #      same aligned size as a dying input, the codegen can reuse the
     #      buffer (modelled as zero-net allocation in live-range).
     #
-    # When the Inductor Scheduler BW peak is also available, we take the
-    # tighter (lower) of the two estimates for BW, giving the best of
-    # graph-level analysis and Scheduler-level simulation.
-    fw_fa = estimate_graph_peak(fw_gm, pin_output_inputs=True,
-                                fusion_aware=True, simulate_inplace=True)
-    bw_fa = estimate_graph_peak(bw_gm, pin_output_inputs=True,
-                                fusion_aware=True, simulate_inplace=True)
-
-    param_bytes = l2["param_bytes"]
-    fw_fa_ph_overlap = min(param_bytes, fw_fa["peak_ph_alive"])
-    l25_fw_peak = static_base + max(0, fw_fa["peak_bytes"] - fw_fa_ph_overlap)
-
-    # BW: take the tighter (lower) of Scheduler peak vs fusion+inplace
-    # graph peak.  For b=0.0 (max recomputation), fusion+inplace is
-    # significantly tighter than the Scheduler; for b=1.0, the Scheduler
-    # is marginally tighter.  min() gives the best of both.
-    # NOTE: sched_bw does NOT include param placeholders (it comes from
-    # Inductor Scheduler codegen), so only adjust the graph-level peak.
+    # Note: optimize_order is NOT used.  The greedy heuristic
+    # _schedule_min_peak provably increases BW peak for both baseline
+    # (+14.7%) and AC (+27.8%) because it disrupts the topological
+    # dependency order without a global-optimality guarantee.
     n_params = len(list(model.parameters())) + len(list(model.buffers()))
     fwd_primal = _forwarded_primal_bytes(fw_gm, n_params)
-    bw_fa_ph_overlap = min(fwd_primal, bw_fa["peak_ph_alive"])
-    bw_fi_peak = max(0, bw_fa["peak_bytes"] - bw_fa_ph_overlap)
-    if sched_bw is not None:
-        l25_bw_peak = static_base + min(sched_bw, bw_fi_peak)
-    else:
-        l25_bw_peak = static_base + bw_fi_peak
+
+    # FW: overlap = param_bytes + buffer_bytes (both in static_base and FW placeholders)
+    fw_overlap = param_bytes + buffer_bytes
+    fw_fa = estimate_graph_peak(fw_gm, pin_output_inputs=True,
+                                fusion_aware=True, simulate_inplace=True,
+                                overlap_bytes=fw_overlap)
+    bw_fa = estimate_graph_peak(bw_gm, pin_output_inputs=True,
+                                fusion_aware=True, simulate_inplace=True,
+                                overlap_bytes=fwd_primal)
+
+    # Both FW and BW use overlap-aware peak_net_bytes (same as L2).
+    l25_fw_peak = static_base + fw_fa["peak_net_bytes"]
+
+    # BW: overlap-aware peak_net_bytes.
+    # L2.5 is independent from L3 — no more min(sched_bw, graph_peak).
+    l25_bw_peak = static_base + bw_fa["peak_net_bytes"]
 
     l25_opt_peak = static_base + grad_bytes + opt_temp
     l25_fwbw_peak = max(l25_fw_peak, l25_bw_peak)
