@@ -34,13 +34,16 @@ def validate(static_result: dict, runtime_result: Union[StepResult, PhaseResult]
     mre_reserved = abs(static_peak - runtime_reserved) / runtime_reserved if runtime_reserved > 0 else float("inf")
     direction = "over" if static_peak > runtime_peak else "under"
 
+    static_fwbw = max(static_result.get("fw_peak", 0), static_result.get("bw_peak", 0))
     breakdown = {
         "static_param": _pick(static_result, "param_bytes", "param"),
+        "static_buffer": static_result.get("buffer_bytes", 0),
         "static_grad": _pick(static_result, "grad_bytes", "grad"),
         "static_optim": _pick(static_result, "optimizer_bytes", "optim_bytes", "optim"),
-        "static_act": static_result.get("act_peak", static_result.get("fwbw_peak", 0)),
-        "static_fw_peak": _pick(static_result, "fw_peak_bytes", "fw_graph_peak", "fw_peak"),
-        "static_bw_peak": _pick(static_result, "bw_peak_bytes", "bw_graph_peak", "bw_peak"),
+        "static_act": static_fwbw,
+        "static_graph_act": static_result.get("act_peak", 0),
+        "static_fw_peak": _pick(static_result, "fw_peak", "fw_peak_bytes", "fw_graph_peak"),
+        "static_bw_peak": _pick(static_result, "bw_peak", "bw_peak_bytes", "bw_graph_peak"),
         "runtime_peak": runtime_peak,
         "runtime_base": runtime_result.base_allocated,
         "runtime_act_delta": runtime_result.activation_delta,
@@ -72,10 +75,9 @@ def analyze_error_sources(static_result: dict, runtime_result: Union[StepResult,
     static_peak = _pick(static_result, "true_peak", "estimated_peak", "total")
     static_fixed = (
         _pick(static_result, "param_bytes", "param")
-        + _pick(static_result, "grad_bytes", "grad")
         + _pick(static_result, "optimizer_bytes", "optim_bytes", "optim")
+        + static_result.get("buffer_bytes", 0)
     )
-    static_act = static_result.get("act_peak", static_result.get("fwbw_peak", 0))
 
     is_phased = isinstance(runtime_result, PhaseResult)
     runtime_peak = runtime_result.overall_peak if is_phased else runtime_result.peak_allocated
@@ -85,12 +87,26 @@ def analyze_error_sources(static_result: dict, runtime_result: Union[StepResult,
     allocator_overhead = runtime_reserved - runtime_peak if runtime_reserved else 0
     total_error = static_peak - runtime_peak
 
+    if is_phased:
+        fw_err = static_result.get("fw_peak", 0) - runtime_result.fw_peak
+        bw_err = static_result.get("bw_peak", 0) - runtime_result.bw_peak
+        opt_err = static_result.get("opt_peak", 0) - runtime_result.opt_peak
+        activation_err = max((fw_err, bw_err), key=lambda v: abs(v))
+    else:
+        fw_err = bw_err = opt_err = 0
+        activation_err = static_result.get("fwbw_peak", static_result.get("act_peak", 0)) - runtime_act
+
     return {
         "total_error": total_error,
         "total_error_pct": total_error / runtime_peak * 100 if runtime_peak > 0 else 0,
         "sources": [
-            ("fixed (param+grad+optim) vs base", static_fixed - runtime_base),
-            ("activation (static vs delta)", static_act - runtime_act),
+            ("fixed (param+optim+buffer) vs base", static_fixed - runtime_base),
+            ("activation phase peak error", activation_err),
             ("allocator overhead (reserved-alloc)", allocator_overhead),
         ],
+        "phase_errors": {
+            "fw_peak": fw_err,
+            "bw_peak": bw_err,
+            "opt_peak": opt_err,
+        },
     }

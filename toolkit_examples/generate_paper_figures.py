@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate 7 publication-quality figures from experiment CSV data.
+"""Generate publication-quality figures from experiment CSV data.
 
 Usage::
 
@@ -8,8 +8,9 @@ Usage::
 Output directory: toolkit_examples/outputs/paper_figures/
 Formats: PDF (vector) + PNG (300 dpi raster)
 
-Prerequisites: run ex_sim_accuracy, ex_peak_phase, ex_model_generalization
-first to populate the CSV/data files.  Missing CSVs are skipped gracefully.
+Prerequisites: run ex_sim_accuracy, ex_peak_phase, ex_model_generalization,
+and optionally ex_horizontal_comparison first to populate the CSV/data files.
+Missing CSVs are skipped gracefully.
 
 Figure mapping:
   F1: Memory Composition Breakdown        — from L1 config estimation (no CSV)
@@ -19,6 +20,8 @@ Figure mapping:
   F5: Peak Phase Heatmap                   — from ex_peak_phase.csv
   F6: Three-Phase Stacked Bar              — from ex_peak_phase.csv
   F7: Model Generalization Heatmap         — from ex_model_generalization.csv
+  F8: Horizontal Method Comparison         — from ex_horizontal_comparison.csv
+  F9: L2.5 Ablation                        — from ex_horizontal_comparison.csv
 """
 
 import csv
@@ -48,6 +51,8 @@ from toolkit.output.pub_charts import (
     plot_f6_merged,
     plot_f7_model_heatmap,
     plot_f7_merged,
+    plot_f8_horizontal_methods,
+    plot_f9_l25_ablation,
 )
 
 DATA_DIR = Path(__file__).with_name("outputs")
@@ -219,6 +224,48 @@ def _gen_f7():
     print("  [OK] F7_model_heatmap_merged")
 
 
+# ── F8: Horizontal Method Comparison ─────────────────────────────
+def _gen_f8():
+    """F8: Average MRE across L1/ShapeSum/L2/L2.5/L3 methods."""
+    rows = _load_csv("ex_horizontal_comparison.csv")
+    if not rows:
+        return
+
+    valid = [r for r in rows if not r.get("error")]
+    if not valid:
+        print("  [SKIP] F8: no successful horizontal rows")
+        return
+
+    fig = plot_f8_horizontal_methods(
+        valid,
+        subtitle="quick or paper config from ex_horizontal_comparison",
+    )
+    savefig_pub(fig, OUT_DIR / "F8_horizontal_methods")
+    plt.close(fig)
+    print("  [OK] F8_horizontal_methods")
+
+
+# ── F9: L2.5 Ablation ────────────────────────────────────────────
+def _gen_f9():
+    """F9: L2 → fusion-only → safe-reuse → L3 ablation."""
+    rows = _load_csv("ex_horizontal_comparison.csv")
+    if not rows:
+        return
+
+    valid = [r for r in rows if not r.get("error")]
+    if not valid:
+        print("  [SKIP] F9: no successful horizontal rows")
+        return
+
+    fig = plot_f9_l25_ablation(
+        valid,
+        subtitle="quick or paper config from ex_horizontal_comparison",
+    )
+    savefig_pub(fig, OUT_DIR / "F9_l25_ablation")
+    plt.close(fig)
+    print("  [OK] F9_l25_ablation")
+
+
 # ── Main ─────────────────────────────────────────────────────────
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -239,6 +286,8 @@ def main():
         _gen_f5()
         _gen_f6()
         _gen_f7()
+        _gen_f8()
+        _gen_f9()
 
     # List generated files
     files = sorted(OUT_DIR.glob("*.*"))

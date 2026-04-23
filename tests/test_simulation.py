@@ -8,7 +8,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 
 from toolkit.capture import capture_graphs, capture_inductor_graphs
 from toolkit.models import ModelRegistry
-from toolkit.simulation import detect_recomputation, estimate_from_config, estimate_graph_peak, estimate_inductor_training_peak, estimate_training_peak
+from toolkit.simulation import detect_recomputation, estimate_from_config, estimate_graph_peak, estimate_inductor_training_peak, estimate_shape_sum_peak, estimate_training_peak
 
 
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -66,6 +66,54 @@ def test_peak_net_bytes_with_overlap():
     result_with_overlap = estimate_graph_peak(gm, overlap_bytes=result_no_overlap["peak_bytes"])
     assert result_with_overlap["peak_net_bytes"] <= result_with_overlap["peak_bytes"]
     assert result_with_overlap["peak_bytes"] == result_no_overlap["peak_bytes"]
+
+
+def test_inplace_reuse_does_not_recycle_placeholder():
+    """L2.5 safe reuse must not donate graph input/placeholder storage."""
+    def fn(x):
+        return x + 1.0
+
+    gm = _trace_fake(fn, torch.randn(4, 4))
+    result = estimate_graph_peak(gm, simulate_inplace=True)
+    assert result["n_reuses"] == 0
+
+
+def test_shape_sum_baseline_fields():
+    def fn(x):
+        a = x + 1.0
+        return a * 2.0
+
+    gm = _trace_fake(fn, torch.randn(4, 4))
+    model = torch.nn.Linear(4, 4)
+    result = estimate_shape_sum_peak(gm, gm, model, optimizer_cls=torch.optim.SGD)
+
+    assert result["tag"] == "shape_sum_graph"
+    assert result["shape_sum_fw_bytes"] > 0
+    assert result["shape_sum_bw_bytes"] > 0
+    assert result["true_peak"] == max(result["fw_peak"], result["bw_peak"], result["opt_peak"])
+
+
+def test_inductor_estimator_recomp_disables_bw_safe_reuse_and_reports_l3_inputs():
+    def fn(x):
+        a = x + 1.0
+        return a * 2.0
+
+    gm = _trace_fake(fn, torch.randn(4, 4))
+    model = torch.nn.Linear(4, 4)
+    result = estimate_inductor_training_peak(
+        {"fw_gm": gm, "bw_gm": gm, "sched_fw_peak": 4096, "sched_bw_peak": 8192},
+        model,
+        optimizer_cls=torch.optim.SGD,
+        has_recomputation=True,
+    )
+
+    assert result["has_recomputation"] is True
+    assert result["l25_bw_safe_reuse_enabled"] is False
+    assert result["l3_static_base_added"] is True
+    assert result["l3_fw_graph_input_bytes"] > 0
+    assert result["l3_bw_graph_input_bytes"] > 0
+    assert result["l3_fw_peak"] == result["base"] + 4096
+    assert result["l3_bw_peak"] == result["base"] + 8192
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires GPU")

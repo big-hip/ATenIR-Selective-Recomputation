@@ -8,4 +8,5 @@ from .pub_charts import (
     plot_f3_peak_comparison, plot_f4_mre,
     plot_f5_peak_phase_heatmap, plot_f6_phase_stack,
     plot_f7_model_heatmap,
+    plot_f8_horizontal_methods, plot_f9_l25_ablation,
 )

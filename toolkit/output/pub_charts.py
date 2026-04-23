@@ -1,4 +1,4 @@
-"""Publication-quality chart functions for the thesis (F1–F7).
+"""Publication-quality chart functions for the thesis (F1–F9).
 
 Each function takes structured data and returns a matplotlib Figure.
 All honour the ``paper_style()`` context.
@@ -11,6 +11,8 @@ Figure mapping:
   F5: Peak Phase Heatmap (batch×optimizer) — from ex_peak_phase.csv
   F6: Three-Phase Stacked Bar (fw/bw/opt)  — from ex_peak_phase.csv
   F7: Model Generalization Heatmap         — from ex_model_generalization.csv
+  F8: Horizontal Method Comparison         — from ex_horizontal_comparison.csv
+  F9: L2.5 Ablation                        — from ex_horizontal_comparison.csv
 
 Usage::
 
@@ -990,6 +992,106 @@ def plot_f7_merged(rows: List[Row],
 plot_f3_overview = plot_f2_strategy_overview
 plot_f4_pareto = plot_f2_strategy_overview
 plot_f5_peak_comparison = plot_f3_peak_comparison
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  F8: Horizontal method comparison
+# ═══════════════════════════════════════════════════════════════════
+def plot_f8_horizontal_methods(rows: List[Row],
+                               fig_width: float = COLUMN_THESIS,
+                               subtitle: str = "") -> plt.Figure:
+    """Average MRE by simulation method.
+
+    Expected keys include l1_mre, shape_sum_mre, l2_mre,
+    l25_fusion_mre, l25_safe_mre, l3_mre.
+    """
+    methods = [
+        ("L1 formula", "l1_mre", COLORS["gold"]),
+        ("ShapeSum", "shape_sum_mre", COLORS["gray"]),
+        ("L2", "l2_mre", LEVEL_COLORS["L2"]),
+        ("L2.5 fusion", "l25_fusion_mre", COLORS["orange"]),
+        ("L2.5 safe", "l25_safe_mre", LEVEL_COLORS["L2.5"]),
+        ("L3", "l3_mre", LEVEL_COLORS["L3"]),
+    ]
+    vals = []
+    for label, key, color in methods:
+        mres = [_to_float(r.get(key, 0)) * 100 for r in rows
+                if _to_float(r.get(key, 0)) > 0]
+        if mres:
+            vals.append((label, sum(mres) / len(mres), color, len(mres)))
+
+    vals.sort(key=lambda item: item[1], reverse=True)
+    fig, ax = plt.subplots(figsize=(fig_width, 3.0), constrained_layout=True)
+    y = np.arange(len(vals))
+    ax.barh(y, [v for _, v, _, _ in vals], color=[c for _, _, c, _ in vals], alpha=0.85)
+    ax.axvline(10, color=COLORS["red"], ls="--", lw=1.0, alpha=0.6)
+    ax.set_yticks(y)
+    ax.set_yticklabels([label for label, _, _, _ in vals])
+    ax.set_xlabel("Average MRE (%)")
+    ax.set_title("Horizontal Method Comparison")
+    ax.grid(axis="x", alpha=0.2, lw=0.4)
+    for yi, (_, value, _, count) in enumerate(vals):
+        ax.text(value + max(0.5, value * 0.02), yi, f"{value:.1f}%  n={count}",
+                va="center", fontsize=ANNOT_SIZE)
+    if subtitle:
+        fig.text(0.5, -0.01, subtitle, ha="center", fontsize=ANNOT_SIZE,
+                 fontstyle="italic", color="#666")
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  F9: L2.5 ablation
+# ═══════════════════════════════════════════════════════════════════
+def plot_f9_l25_ablation(rows: List[Row],
+                         fig_width: float = COLUMN_THESIS,
+                         subtitle: str = "") -> plt.Figure:
+    """Ablation from L2 to fusion-only, safe reuse, and L3.
+
+    Values are averaged per strategy across available models.
+    """
+    specs = [
+        ("L2", "l2_mre", LEVEL_COLORS["L2"], "o"),
+        ("Fusion-only", "l25_fusion_mre", COLORS["orange"], "s"),
+        ("Safe reuse", "l25_safe_mre", LEVEL_COLORS["L2.5"], "D"),
+        ("L3", "l3_mre", LEVEL_COLORS["L3"], "^"),
+    ]
+    strategies = []
+    for r in rows:
+        strat = r.get("strategy")
+        if strat and strat not in strategies and _to_float(r.get("l2_mre", 0)) > 0:
+            strategies.append(strat)
+
+    strategy_vals = []
+    for strat in strategies:
+        subset = [r for r in rows if r.get("strategy") == strat]
+        avg = []
+        for _, key, _, _ in specs:
+            vals = [_to_float(r.get(key, 0)) * 100 for r in subset
+                    if _to_float(r.get(key, 0)) > 0]
+            avg.append(sum(vals) / len(vals) if vals else np.nan)
+        if any(not np.isnan(v) for v in avg):
+            strategy_vals.append((strat, avg))
+
+    strategy_vals.sort(key=lambda item: np.nanmean(item[1]))
+    fig, ax = plt.subplots(figsize=(fig_width, 3.2), constrained_layout=True)
+    x = np.arange(len(strategy_vals))
+    offsets = np.linspace(-0.27, 0.27, len(specs))
+    for offset, (label, _key, color, marker), idx in zip(offsets, specs, range(len(specs))):
+        vals = [avg[idx] for _, avg in strategy_vals]
+        ax.scatter(x + offset, vals, color=color, marker=marker, s=42,
+                   edgecolors="white", linewidths=0.4, label=label, zorder=3)
+    ax.axhline(10, color=COLORS["red"], ls="--", lw=1.0, alpha=0.55)
+    ax.set_xticks(x)
+    ax.set_xticklabels([short_strategy_name(s) for s, _ in strategy_vals],
+                       rotation=30, ha="right")
+    ax.set_ylabel("MRE (%)")
+    ax.set_title("L2.5 Ablation")
+    ax.grid(axis="y", alpha=0.2, lw=0.4)
+    ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
+    if subtitle:
+        fig.text(0.5, -0.01, subtitle, ha="center", fontsize=ANNOT_SIZE,
+                 fontstyle="italic", color="#666")
+    return fig
 plot_f6_mre = plot_f4_mre
 plot_f7_batch_scaling = None
 plot_f8_heatmap = None

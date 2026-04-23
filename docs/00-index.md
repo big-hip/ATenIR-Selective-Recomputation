@@ -25,8 +25,9 @@
 | 12 | `12-inductor-memory-analysis.md` | Inductor 后端内存分析：管线、L3 Scheduler hook | 第 2 章 §2.6 |
 | 13 | `13-l2.5-fusion-aware-design.md` | L2.5 融合感知仿真：fusion group 识别与 internal 消除 | 第 2 章 §2.5 |
 | 14 | `14-aten-recompute-key-ideas.md` | 已删除 aten_recompute 目录关键设计存档 | 附录 |
-| 15 | `15-experiment-outputs.md` | 实验输出说明：3 个 CSV + 7 类论文图表 (F1-F7) | 第 3 章 |
+| 15 | `15-experiment-outputs.md` | 实验输出说明：4 个 CSV + 9 类论文图表 (F1-F9) | 第 3 章 |
 | 16 | `16-param-double-counting-fix.md` | 参数双重计数修复：`peak_ph_alive` + `_forwarded_primal_bytes`，MRE 12%→8.8% | 第 2 章 §2.4 |
+| 17 | `17-current-simulation-fixes.md` | 本轮仿真语义修复记录：view-base、L2.5 allowlist/safe reuse、ShapeSum 横向对比 | 第 2-3 章 |
 | — | `sim-optimization-plan.md` | 仿真精度优化方案：Overlap-Aware Peak + 编译器元数据重计算检测 | 第 2 章 §2.4 |
 
 ---
@@ -43,7 +44,7 @@
 | 4 | `toolkit/simulation/` | L1 公式法 + L2 图遍历 + L2.5 融合感知 + L3 Scheduler |
 | 5 | `toolkit/strategy/` | AC / SAC / partition / memory_budget 完整 |
 | 6 | `toolkit/profiler/` | `measure_phased` (IQR mean) + `validate` + `analyze_error_sources` |
-| 7 | `toolkit/output/` | console / charts / export + pub_charts (F1-F7) + pub_style |
+| 7 | `toolkit/output/` | console / charts / export + pub_charts (F1-F9) + pub_style |
 
 ### 论文实验脚本
 
@@ -53,9 +54,10 @@
 | `ex_sim_accuracy.py` | §5.1 | 12 策略 L2/L2.5/L3 仿真精度 (LLaMA ~870M, B=8, S=512) | `ex_sim_accuracy.csv` |
 | `ex_peak_phase.py` | §5.2 | batch×optimizer 峰值阶段分析 (LLaMA ~870M) | `ex_peak_phase.csv` |
 | `ex_model_generalization.py` | §5.3 | 3 模型×6 策略通用性验证 (GPT-2/LLaMA/Mistral) | `ex_model_generalization.csv` |
-| `generate_paper_figures.py` | — | 论文图表生成 (F1-F7, PDF+PNG) | `outputs/paper_figures/` |
+| `ex_horizontal_comparison.py` | §5.4 | L1/ShapeSum/L2/L2.5/L3 横向方法对比 | `ex_horizontal_comparison.csv` |
+| `generate_paper_figures.py` | — | 论文图表生成 (F1-F9, PDF+PNG) | `outputs/paper_figures/` |
 
-### 论文图表 (F1-F7)
+### 论文图表 (F1-F9)
 
 | 编号 | 内容 | 数据来源 |
 |------|------|---------|
@@ -66,8 +68,10 @@
 | F5 | 峰值阶段热力图 (batch × optimizer) | ex_peak_phase.csv |
 | F6 | FW/BW/OPT 三阶段堆叠柱状图 | ex_peak_phase.csv |
 | F7 | 模型 × 策略 MRE 热力图 | ex_model_generalization.csv |
+| F8 | 横向方法平均 MRE 对比 | ex_horizontal_comparison.csv |
+| F9 | L2 → fusion-only → safe-reuse → L3 消融 | ex_horizontal_comparison.csv |
 
-### 测试: 10 个文件, 85 个 test 函数
+### 测试: pytest 回归测试覆盖 capture / simulation / fusion / profiler 等模块
 
 ---
 
@@ -87,3 +91,4 @@
 | v6.2 | 2025-04-20 | 脚本合并 (ex1-ex8 → 3 脚本) + 论文图表系统 (F1-F7) + TF32/警告管理 |
 | v7 | 2025-04-20 | 文档全面整理：按代码最终状态重写 docs/ + plans/，论文可直接引用 |
 | **v7.1** | **2025-04-21** | **项目整理：README/requirements/Docker/Makefile 对齐实际代码，清理诊断脚本** |
+| **v7.2** | **2026-04-23** | **仿真语义修复：tuple/list view-base pin、保守 L2.5 allowlist、安全 reuse、ShapeSum 横向基线与 F8/F9** |

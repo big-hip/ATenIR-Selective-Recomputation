@@ -6,6 +6,37 @@ from toolkit.capture import count_fw_output_bytes
 from toolkit.utils import count_unique_params, is_view_node, val_bytes
 
 
+def _iter_tensor_values(value):
+    if isinstance(value, torch.Tensor):
+        yield value
+        return
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _iter_tensor_values(item)
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_tensor_values(item)
+
+
+def _iter_fx_nodes(value):
+    if isinstance(value, fx.Node):
+        yield value
+        return
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _iter_fx_nodes(item)
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_fx_nodes(item)
+
+
+def _storage_cdata(tensor: torch.Tensor):
+    try:
+        return tensor.untyped_storage()._cdata
+    except Exception:
+        return None
+
+
 def _find_view_base(node: fx.Node) -> fx.Node:
     """Trace a view-node chain back to the base allocation node.
 
@@ -23,21 +54,19 @@ def _find_view_base(node: fx.Node) -> fx.Node:
         val = current.meta.get("val")
         if not isinstance(val, torch.Tensor):
             break
-        try:
-            val_cdata = val.untyped_storage()._cdata
-        except Exception:
+        val_cdata = _storage_cdata(val)
+        if val_cdata is None:
             break
         found = False
         for inp in current.all_input_nodes:
             inp_val = inp.meta.get("val")
-            if isinstance(inp_val, torch.Tensor):
-                try:
-                    if inp_val.untyped_storage()._cdata == val_cdata:
-                        current = inp
-                        found = True
-                        break
-                except Exception:
-                    pass
+            for tensor in _iter_tensor_values(inp_val):
+                if _storage_cdata(tensor) == val_cdata:
+                    current = inp
+                    found = True
+                    break
+            if found:
+                break
         if not found:
             break
     return current
@@ -135,6 +164,26 @@ def _schedule_min_peak(
     return placeholders + ordered + remaining + output_node
 
 
+def _model_storage_cdata(model: nn.Module) -> set[int]:
+    storages: set[int] = set()
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        cdata = _storage_cdata(tensor)
+        if cdata is not None:
+            storages.add(cdata)
+    return storages
+
+
+def _node_shares_storage_with(node: fx.Node, storages: set[int]) -> bool:
+    if not storages:
+        return False
+    val = node.meta.get("val")
+    for tensor in _iter_tensor_values(val):
+        cdata = _storage_cdata(tensor)
+        if cdata in storages:
+            return True
+    return False
+
+
 def _forwarded_primal_bytes(fw_gm: fx.GraphModule, n_params: int) -> int:
     """Count bytes of FW outputs that are forwarded model-parameter primals.
 
@@ -176,9 +225,7 @@ def _forwarded_primal_bytes(fw_gm: fx.GraphModule, n_params: int) -> int:
     # the same parameter saved multiple times, e.g. via different views)
     seen_storages: set[int] = set()
     forwarded = 0
-    for arg in output_args:
-        if not isinstance(arg, fx.Node):
-            continue
+    for arg in _iter_fx_nodes(output_args):
         val = arg.meta.get("val")
         if not isinstance(val, torch.Tensor):
             continue
@@ -200,6 +247,7 @@ def estimate_graph_peak(
     optimize_order: bool = False,
     simulate_inplace: bool = False,
     overlap_bytes: int = 0,
+    no_reuse_nodes: set[fx.Node] | None = None,
 ) -> dict:
     """Estimate peak activation memory from an FX graph via live-range analysis.
 
@@ -221,12 +269,17 @@ def estimate_graph_peak(
             ``max_t { current(t) - min(overlap_bytes, ph_alive(t)) }``
             which accounts for the fact that overlap shrinks as
             placeholders are freed.  This fixes AC BW under-estimation.
+        no_reuse_nodes: optional nodes whose buffers must not be recycled in
+            ``simulate_inplace`` mode.  Used by L2.5 to protect graph inputs,
+            pinned outputs, and model parameter/buffer aliases.
 
     Returns:
         dict with peak_bytes, peak_net_bytes, allocation counts, timeline,
         and (when fusion_aware) fusion_groups / internal_nodes / internal_bytes.
     """
     nodes = list(gm.graph.nodes)
+    if no_reuse_nodes is None:
+        no_reuse_nodes = set()
 
     output_inputs = set()
     if pin_output_inputs:
@@ -240,6 +293,7 @@ def estimate_graph_peak(
             if n.op in ("call_function", "call_method") and is_view_node(n):
                 base = _find_view_base(n)
                 output_inputs.add(base)
+        no_reuse_nodes = set(no_reuse_nodes) | output_inputs
 
     node_size: dict[fx.Node, int] = {}
     view_count = 0
@@ -319,7 +373,9 @@ def estimate_graph_peak(
                     if (inp in live
                             and live[inp] == size
                             and last_use.get(inp, -1) <= index
-                            and inp not in output_inputs):
+                            and inp.op != "placeholder"
+                            and inp not in output_inputs
+                            and inp not in no_reuse_nodes):
                         reused_from = inp
                         break
 
@@ -534,6 +590,102 @@ def estimate_training_peak(
     }
 
 
+def estimate_shape_sum_peak(
+    fw_gm: fx.GraphModule,
+    bw_gm: fx.GraphModule,
+    model: nn.Module,
+    optimizer_cls=torch.optim.Adam,
+    fused_optimizer: bool = False,
+    align: int = 512,
+) -> dict:
+    """Naive graph-shape baseline with no live-range analysis.
+
+    This intentionally sums all non-view compute tensor sizes in each graph.
+    It is a shape-inference baseline, not a realistic allocator model.
+    """
+
+    def _graph_shape_sum(gm: fx.GraphModule) -> int:
+        total = 0
+        for node in gm.graph.nodes:
+            if node.op == "output":
+                continue
+            if node.op in ("placeholder", "output"):
+                continue
+            if node.op in ("call_function", "call_method") and is_view_node(node):
+                continue
+            val = node.meta.get("val")
+            nb = val_bytes(val) if val is not None else 0
+            if nb > 0:
+                total += (nb + align - 1) & ~(align - 1)
+        return total
+
+    param_bytes = count_unique_params(model)
+    if optimizer_cls in (torch.optim.Adam, torch.optim.AdamW):
+        optim_mul = 2
+    elif optimizer_cls is torch.optim.SGD:
+        optim_mul = 0
+    else:
+        optim_mul = 2
+    optim_bytes = param_bytes * optim_mul
+    buffer_bytes = 0
+    seen_buf_ptrs: set[int] = set()
+    for buf in model.buffers():
+        ptr = buf.data_ptr()
+        if ptr not in seen_buf_ptrs:
+            seen_buf_ptrs.add(ptr)
+            buffer_bytes += buf.numel() * buf.element_size()
+    static_base = param_bytes + optim_bytes + buffer_bytes
+
+    if not fused_optimizer and optim_mul > 0:
+        opt_temp = param_bytes
+    else:
+        opt_temp = 0
+
+    fw_bytes = _graph_shape_sum(fw_gm)
+    bw_bytes = _graph_shape_sum(bw_gm)
+    grad_bytes = param_bytes
+    fw_peak = static_base + fw_bytes
+    bw_peak = static_base + bw_bytes
+    opt_peak = static_base + grad_bytes + opt_temp
+    true_peak = max(fw_peak, bw_peak, opt_peak)
+    if true_peak == fw_peak:
+        phase = "FW"
+    elif true_peak == bw_peak:
+        phase = "BW"
+    else:
+        phase = "OPT"
+    return {
+        "tag": "shape_sum_graph",
+        "param_bytes": param_bytes,
+        "buffer_bytes": buffer_bytes,
+        "grad_bytes": grad_bytes,
+        "optimizer_bytes": optim_bytes,
+        "shape_sum_fw_bytes": fw_bytes,
+        "shape_sum_bw_bytes": bw_bytes,
+        "shape_sum_true_peak": true_peak,
+        "fw_peak": fw_peak,
+        "bw_peak": bw_peak,
+        "opt_peak": opt_peak,
+        "fwbw_peak": max(fw_peak, bw_peak),
+        "true_peak": true_peak,
+        "estimated_peak": true_peak,
+        "peak_phase": phase,
+        "base": static_base,
+        "opt_temp": opt_temp,
+    }
+
+
+def _placeholder_bytes(gm: fx.GraphModule, align: int = 512) -> int:
+    total = 0
+    for node in gm.graph.nodes:
+        if node.op != "placeholder":
+            continue
+        nb = val_bytes(node.meta.get("val"))
+        if nb > 0:
+            total += (nb + align - 1) & ~(align - 1)
+    return total
+
+
 def detect_recomputation(bw_gm: fx.GraphModule) -> bool:
     """Detect whether BW graph contains AC (Activation Checkpointing) recomputed nodes.
 
@@ -609,8 +761,17 @@ def estimate_inductor_training_peak(
     opt_temp = l2["opt_temp"]
     param_bytes = l2["param_bytes"]
     buffer_bytes = l2.get("buffer_bytes", 0)
+    protected_storages = _model_storage_cdata(model)
+    protected_fw_nodes = {
+        n for n in fw_gm.graph.nodes
+        if n.op == "placeholder" or _node_shares_storage_with(n, protected_storages)
+    }
+    protected_bw_nodes = {
+        n for n in bw_gm.graph.nodes
+        if n.op == "placeholder" or _node_shares_storage_with(n, protected_storages)
+    }
 
-    # L2.5: fusion-aware + in-place buffer reuse estimation
+    # L2.5: fusion-aware + conservative in-place buffer reuse estimation
     #
     # Two complementary optimisations modelled statically:
     #   1. Fusion elimination — Triton fused kernels never materialise
@@ -628,12 +789,36 @@ def estimate_inductor_training_peak(
 
     # FW: overlap = param_bytes + buffer_bytes (both in static_base and FW placeholders)
     fw_overlap = param_bytes + buffer_bytes
+    fw_fusion_only = estimate_graph_peak(fw_gm, pin_output_inputs=True,
+                                         fusion_aware=True,
+                                         simulate_inplace=False,
+                                         overlap_bytes=fw_overlap)
+    bw_fusion_only = estimate_graph_peak(bw_gm, pin_output_inputs=True,
+                                         fusion_aware=True,
+                                         simulate_inplace=False,
+                                         overlap_bytes=fwd_primal)
+    l25_fusion_fw_peak = static_base + fw_fusion_only["peak_net_bytes"]
+    l25_fusion_bw_peak = static_base + bw_fusion_only["peak_net_bytes"]
+    l25_fusion_opt_peak = static_base + grad_bytes + opt_temp
+    l25_fusion_true_peak = max(
+        l25_fusion_fw_peak, l25_fusion_bw_peak, l25_fusion_opt_peak
+    )
+    if l25_fusion_true_peak == l25_fusion_fw_peak:
+        l25_fusion_peak_phase = "FW"
+    elif l25_fusion_true_peak == l25_fusion_bw_peak:
+        l25_fusion_peak_phase = "BW"
+    else:
+        l25_fusion_peak_phase = "OPT"
+
     fw_fa = estimate_graph_peak(fw_gm, pin_output_inputs=True,
                                 fusion_aware=True, simulate_inplace=True,
-                                overlap_bytes=fw_overlap)
+                                overlap_bytes=fw_overlap,
+                                no_reuse_nodes=protected_fw_nodes)
     bw_fa = estimate_graph_peak(bw_gm, pin_output_inputs=True,
-                                fusion_aware=True, simulate_inplace=True,
-                                overlap_bytes=fwd_primal)
+                                fusion_aware=True,
+                                simulate_inplace=not has_recomp,
+                                overlap_bytes=fwd_primal,
+                                no_reuse_nodes=protected_bw_nodes)
 
     # Both FW and BW use overlap-aware peak_net_bytes (same as L2).
     l25_fw_peak = static_base + fw_fa["peak_net_bytes"]
@@ -660,10 +845,20 @@ def estimate_inductor_training_peak(
         "l25_fwbw_peak": l25_fwbw_peak,
         "l25_true_peak": l25_true_peak,
         "l25_peak_phase": l25_peak_phase,
+        "l25_fusion_fw_peak": l25_fusion_fw_peak,
+        "l25_fusion_bw_peak": l25_fusion_bw_peak,
+        "l25_fusion_opt_peak": l25_fusion_opt_peak,
+        "l25_fusion_true_peak": l25_fusion_true_peak,
+        "l25_fusion_peak_phase": l25_fusion_peak_phase,
         "fusion_fw_groups": fw_fa.get("fusion_groups", 0),
         "fusion_bw_groups": bw_fa.get("fusion_groups", 0),
         "fusion_fw_eliminated_bytes": fw_fa.get("internal_bytes", 0),
         "fusion_bw_eliminated_bytes": bw_fa.get("internal_bytes", 0),
+        "fusion_only_fw_eliminated_bytes": fw_fusion_only.get("internal_bytes", 0),
+        "fusion_only_bw_eliminated_bytes": bw_fusion_only.get("internal_bytes", 0),
+        "l25_fw_reuses": fw_fa.get("n_reuses", 0),
+        "l25_bw_reuses": bw_fa.get("n_reuses", 0),
+        "l25_bw_safe_reuse_enabled": not has_recomp,
     })
 
     # L3: Scheduler-level estimation
@@ -701,6 +896,9 @@ def estimate_inductor_training_peak(
 
     l2["sched_fw_peak"] = sched_fw
     l2["sched_bw_peak"] = sched_bw
+    l2["l3_fw_graph_input_bytes"] = _placeholder_bytes(fw_gm)
+    l2["l3_bw_graph_input_bytes"] = _placeholder_bytes(bw_gm)
+    l2["l3_static_base_added"] = sched_fw is not None and sched_bw is not None
     return l2
 
 

@@ -28,7 +28,7 @@
                    ▼
             ┌──────────────┐
             │  Pillar 4    │  profiler/: GPU 运行时 ground truth
-            │  验证层       │  output/: 表格 + 图表 + CSV + 论文图表(F1-F7)
+            │  验证层       │  output/: 表格 + 图表 + CSV + 论文图表(F1-F9)
             └──────────────┘
 ```
 
@@ -107,7 +107,7 @@ ATenIR-Selective-Recomputation/
 │   │   ├── console.py           # tabulate 表格 (print_comparison_table, ...)
 │   │   ├── charts.py            # matplotlib 交互图表 (7 种)
 │   │   ├── export.py            # to_csv / to_json
-│   │   ├── pub_charts.py        # 论文图表 (F1-F7: plot_f1..plot_f7)
+│   │   ├── pub_charts.py        # 论文图表 (F1-F9: plot_f1..plot_f9)
 │   │   └── pub_style.py         # paper_style + savefig_pub
 │   └── utils/                   # 共享工具
 │       ├── view_ops.py          # is_view_node() — storage aliasing via _cdata
@@ -119,9 +119,10 @@ ATenIR-Selective-Recomputation/
 │   ├── ex_sim_accuracy.py             # 实验 1: 12 策略仿真精度
 │   ├── ex_peak_phase.py               # 实验 2: batch×optimizer 峰值阶段
 │   ├── ex_model_generalization.py     # 实验 3: 多模型通用性
-│   └── generate_paper_figures.py      # 论文图表 F1-F7
-├── tests/                       # 10 文件, 83 tests
-└── docs/                        # 本文档集 (16 篇)
+│   ├── ex_horizontal_comparison.py    # 实验 4: 横向方法对比
+│   └── generate_paper_figures.py      # 论文图表 F1-F9
+├── tests/                       # pytest 回归测试
+└── docs/                        # 本文档集 (17 篇)
 ```
 
 ---
@@ -199,14 +200,20 @@ def estimate_from_config(
 def estimate_graph_peak(
     gm, pin_output_inputs=False, align=512,
     fusion_aware=False,     # L2.5: 识别融合组，消除内部中间张量
-    optimize_order=False,   # L2.5+: 贪心调度，最小化峰值
+    simulate_inplace=False, # L2.5: 保守建模 safe buffer reuse
+    overlap_bytes=0,        # 与 static_base 重叠的 placeholder 字节
+    no_reuse_nodes=None,    # placeholder / 输出 base / 参数 alias 等禁止复用
 ) -> dict
 
 def estimate_training_peak(fw_gm, bw_gm, model, optimizer_cls=Adam,
                            fused_optimizer=False) -> dict  # L2 完整训练步估算
 
+def estimate_shape_sum_peak(fw_gm, bw_gm, model, optimizer_cls=Adam,
+                            fused_optimizer=False) -> dict  # ShapeSum_graph naive baseline
+
 def estimate_inductor_training_peak(
     capture_result: dict, model, optimizer_cls=Adam, fused_optimizer=False,
+    has_recomputation=None,
 ) -> dict  # L2 + L2.5 + L3 三层估算
 
 def make_level_stub(est: dict, prefix: str) -> dict | None  # 提取 L2.5/L3 子结果用于 validate()
@@ -292,7 +299,7 @@ measure_step/measure_phased("run", forward_fn, optimizer)  → StepResult/PhaseR
 validate(static_result, runtime_result, run_mode="compiled")  → ValidationResult
     │
     ▼
-output/: console table + charts + CSV + 论文图表 (F1-F7)
+output/: console table + charts + CSV + 论文图表 (F1-F9)
 ```
 
 > **loss_fn 贯穿路径**: ModelSpec → capture_graphs → measure_step → validate。
@@ -326,8 +333,8 @@ L2 的输入是 `fw_gm` / `bw_gm` 两张带 `meta['val']` 的 FX 图，算法流
 7. **记录时间线与峰值**：每个节点都更新 `timeline` 和 `peak_bytes`，最终得到 `fw_peak` / `bw_peak`。
 8. **拼出训练步总峰值**（四峰值体系）：
    ```python
-   fw_peak  = static_base + fw_graph_peak
-   bw_peak  = static_base + grad_bytes + bw_graph_peak
+   fw_peak  = static_base + fw_graph_peak_net
+   bw_peak  = static_base + bw_graph_peak_net
    opt_peak = static_base + grad_bytes + opt_temp
    fwbw_peak = max(fw_peak, bw_peak)
    true_peak = max(fw_peak, bw_peak, opt_peak)
@@ -337,10 +344,10 @@ L2 的输入是 `fw_gm` / `bw_gm` 两张带 `meta['val']` 的 FX 图，算法流
 
 Inductor 后端会将连续的 pointwise/reduction 算子融合成单个 Triton kernel，内部中间张量不需要在 GPU 全局内存中物化。L2.5 通过以下方式近似这一行为：
 
-1. **算子分类** (`fusion_ops.py`): 区分 extern ops (mm/bmm/sdpa → CUBLAS/cuDNN) 和 fusable ops (pointwise/reduction)
-2. **融合组识别** (`fusion_groups.py`): 贪心拓扑扫描，将连续 fusable ops 合并为组
-3. **内部消除**: 融合组内部中间节点的分配设为 0
-4. **调度优化** (`optimize_order=True`): 贪心调度最小化峰值活跃内存
+1. **算子分类** (`fusion_ops.py`): extern ops 明确作为 barrier；fusable 只接受保守 allowlist（简单 pointwise/unary/binary 等），unknown 默认不消除
+2. **融合组识别** (`fusion_groups.py`): 贪心拓扑扫描，仅允许 fusable producer/consumer 合并；embedding/gather/scatter/clone/random/layout/复杂 reduction 暂不消除
+3. **内部消除**: 融合组内部中间节点的分配设为 0，并单独输出 fusion-only 结果
+4. **安全复用**: `simulate_inplace=True` 时禁止复用 placeholder、graph input、参数/buffer alias、pinned output base；有重计算的 BW 图禁用 safe reuse
 
 ### 7.4 L3 Scheduler 仿真
 
@@ -348,9 +355,10 @@ L3 直接复用 Inductor 的 `Scheduler.estimate_peak_memory()` 方法：
 
 1. `capture_inductor_graphs()` 通过 monkey-patch `Scheduler.__init__` 捕获 FW/BW 的 `estimate_peak_memory` 返回值
 2. `sched_fw_peak` / `sched_bw_peak` 代表 Scheduler 视角下的激活峰值
-3. 加上 `static_base`（param + optim state）即得 L3 绝对峰值
+3. 当前实现输出 `l3_fw_graph_input_bytes` / `l3_bw_graph_input_bytes` 诊断 Scheduler peak 与 graph input 的关系
+4. L3 是独立路径：`static_base + sched_peak`，不再与 L2.5 的 fusion 结果取 `min`
 
-L2.5 的 BW 估算采用 `min(sched_bw, bw_fusion_aware)` 取更紧的值。
+如果 GPU 校准发现 Scheduler peak 已包含某些 input buffer，需要按诊断结果扣除对应重叠，避免 `static_base + sched_peak` 双计。
 
 ### 7.5 各层覆盖范围
 
@@ -360,8 +368,8 @@ L2.5 的 BW 估算采用 `min(sched_bw, bw_fusion_aware)` 取更紧的值。
 | 激活生命周期 | ❌ | ✅ 图遍历 | ✅ 图遍历 | ✅ Scheduler |
 | View aliasing | ❌ | ✅ _cdata | ✅ _cdata | ✅ Scheduler |
 | 512B 对齐 | ❌ | ✅ | ✅ | ✅ |
-| Fusion 消除 | ❌ | ❌ | ✅ 近似 | ✅ 精确 |
-| 执行顺序优化 | ❌ | ❌ | ✅ 贪心 | ✅ Scheduler |
+| Fusion 消除 | ❌ | ❌ | ✅ 保守近似 | ✅ Scheduler 内部 |
+| Buffer reuse | ❌ | ❌ | ✅ 保守 safe reuse | ✅ Scheduler/代码生成 |
 
 ### 7.4 动态侧验证：compiled ground truth
 
@@ -381,12 +389,12 @@ L2.5 的 BW 估算采用 `min(sched_bw, bw_fusion_aware)` 取更紧的值。
 
 | Level | 方法 | aot_eager MRE | inductor MRE | 对标工具 |
 |-------|------|-------------|-------------|----------|
-| **L1** | Config 公式推导 | 15-25% | — | DNNMem |
+| **L1** | Config 公式推导 | 15-25% | — | 公式基线 |
 | **L2** | FX 图遍历 + 512B | **1-7%** | 28-38% (不建模 fusion) | — |
-| **L2.5** | + 融合感知 | — | **8-12%** | — |
-| **L3** | + Scheduler hook | — | **5-7%** | Inductor 内部 |
+| **L2.5** | + fusion-only / safe-reuse | — | 待重跑 | — |
+| **L3** | + Scheduler hook | — | 待重跑 | Inductor 内部 |
 
-> L2 在 aot_eager 后端已达到极高精度；inductor 后端需要 L2.5/L3 才能达到可用精度。
+> L2 在 aot_eager 后端已达到较高精度；inductor 后端需要 L2.5/L3 才能达到可用精度。旧 CSV 的 L2.5 MRE 使用过宽融合口径，当前修复后需重新运行主实验。
 > 详见 `15-experiment-outputs.md` 和 `ex_sim_accuracy.csv`。
 
 ---
@@ -442,7 +450,7 @@ L2.5 的 BW 估算采用 `min(sched_bw, bw_fusion_aware)` 取更紧的值。
 
 ```
 精度低                                              精度高
-├── DeepSpeed 公式法 ──── DNNMem ──── 我们(ATen IR L2) ──── xMem ──── LLMem
+├── DeepSpeed 公式法 ──── Shape/公式基线 ──── 我们(ATen IR L2) ──── xMem ──── LLMem
 │   (不算 activation)  (MRE ~19%)   (MRE 6.9%)        (CPU trace)  (需 GPU)
 │
 │   不需要 GPU ──────────────────────────────────────── 需要 GPU ───
@@ -464,7 +472,7 @@ L2.5 的 BW 估算采用 `min(sched_bw, bw_fusion_aware)` 取更紧的值。
 | **4** | simulation/ | L2 MRE=2.2%(eager)→6.6%(compiled)→**6.9%**(B10修后) | 见 04-dev-log |
 | **5** | strategy/ | AC -12~25%, min_cut -12~20%, MRE 7.5% | 见 04-dev-log |
 | **6** | profiler/ | `measure_phased` + `validate` + `analyze_error_sources` | 见 04-dev-log |
-| **7** | output/ | console + charts + export + pub_charts (F1-F7) + pub_style | 见 04-dev-log |
+| **7** | output/ | console + charts + export + pub_charts (F1-F9) + pub_style | 见 04-dev-log |
 
 > 详细实验数据见 `docs/15-experiment-outputs.md` 和 `toolkit_examples/outputs/` 下的 CSV 文件。
 
@@ -480,4 +488,4 @@ L2.5 的 BW 估算采用 `min(sched_bw, bw_fusion_aware)` 取更紧的值。
 | `_cdata` 未来变化 | 低 | 封装在 `is_view_node()` | 未变 |
 | SAC eager overhead | 中 | 需 Dynamo 路径 | 已确认 |
 | dark_base 16-19 MB gap | 低 | L2 为 lower bound；放大模型后 <0.1% | 已量化 |
-| L2 inductor 高 MRE (28-38%) | 中 | L2.5 (8-12%) 和 L3 (5-7%) 已解决 | ✅ |
+| L2 inductor 高 MRE (28-38%) | 中 | L2.5 已改为保守 allowlist + safe reuse；L3 需 GPU 重跑校准 | 重跑中 |

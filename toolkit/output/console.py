@@ -16,15 +16,21 @@ _BYTE_KEYS = frozenset({
     "opt_peak", "fwbw_peak", "true_peak", "opt_temp",
     "fw_graph_peak", "bw_graph_peak",
     "base", "after_fw", "after_bw", "after_opt", "overall_peak",
+    "l1_true_peak",
     # L2 explicit keys
     "l2_fw_peak", "l2_bw_peak", "l2_opt_peak", "l2_fwbw_peak", "l2_true_peak",
     # L2.5 fusion-aware keys
     "l25_fw_peak", "l25_bw_peak", "l25_opt_peak", "l25_fwbw_peak", "l25_true_peak",
+    "l25_fusion_fw_peak", "l25_fusion_bw_peak", "l25_fusion_opt_peak",
+    "l25_fusion_true_peak",
+    "l25_safe_fw_peak", "l25_safe_bw_peak", "l25_safe_opt_peak",
+    "l25_safe_true_peak",
     # L3 scheduler keys
     "l3_fw_peak", "l3_bw_peak", "l3_opt_peak", "l3_fwbw_peak", "l3_true_peak",
     "sched_fw_peak", "sched_bw_peak",
     # Runtime explicit keys
     "rt_fw_peak", "rt_bw_peak", "rt_opt_peak", "rt_true_peak",
+    "shape_sum_fw_bytes", "shape_sum_bw_bytes", "shape_sum_true_peak",
 })
 
 

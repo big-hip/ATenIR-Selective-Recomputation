@@ -1,6 +1,6 @@
 # 15 — 实验输出说明文档
 
-> **文档定位**: 说明当前 3 个实验脚本的 CSV 输出、7 类论文图表 (F1-F7) 的读图方法和论文引用建议。
+> **文档定位**: 说明当前 4 个实验脚本的 CSV 输出、9 类论文图表 (F1-F9) 的读图方法和论文引用建议。
 >
 > 所有输出保存在 `toolkit_examples/outputs/` 目录下。
 
@@ -15,10 +15,11 @@
 | `ex_sim_accuracy.py` | §5.1 | 12 策略 L2/L2.5/L3 仿真精度 | `ex_sim_accuracy.csv` |
 | `ex_peak_phase.py` | §5.2 | batch×optimizer 峰值阶段分析 | `ex_peak_phase.csv` |
 | `ex_model_generalization.py` | §5.3 | 3 模型×6 策略通用性验证 | `ex_model_generalization.csv` |
+| `ex_horizontal_comparison.py` | §5.4 | L1/ShapeSum/L2/L2.5/L3 横向方法对比 | `ex_horizontal_comparison.csv` |
 
 另有 `ex1_multi_model_capture.py` 作为 Demo（无 CSV 输出，仅控制台）。
 
-### 论文图表 (F1-F7)
+### 论文图表 (F1-F9)
 
 由 `generate_paper_figures.py` 生成，输出至 `outputs/paper_figures/`，每张图同时保存 PDF + PNG 两种格式。
 
@@ -28,11 +29,13 @@
 | F2 | 12 策略总览 + Pareto 图 | ex_sim_accuracy.csv | 2 |
 | F3 | RT vs L2 vs L2.5 vs L3 分组柱状图 | ex_sim_accuracy.csv | 2 |
 | F4 | L2/L2.5/L3 MRE 对比 | ex_sim_accuracy.csv | 2 |
-| F5 | 峰值阶段热力图 (per strategy) | ex_peak_phase.csv | 8 (4策略×2格式) |
-| F6 | FW/BW/OPT 三阶段堆叠柱状图 | ex_peak_phase.csv | 4 (2策略×2格式) |
-| F7 | 模型×策略 MRE 热力图 (per level) | ex_model_generalization.csv | 6 (3层×2格式) |
+| F5 | 峰值阶段 merged 热力图 | ex_peak_phase.csv | 2 |
+| F6 | FW/BW/OPT merged 阶段堆叠图 | ex_peak_phase.csv | 2 |
+| F7 | 模型×策略×层级 merged MRE 热力图 | ex_model_generalization.csv | 2 |
+| F8 | 横向方法平均 MRE 对比 | ex_horizontal_comparison.csv | 2 |
+| F9 | L2 → fusion-only → safe-reuse → L3 消融 | ex_horizontal_comparison.csv | 2 |
 
-共 26 个文件。
+共 18 个文件（若缺少 `ex_horizontal_comparison.csv`，F8/F9 会跳过）。
 
 ---
 
@@ -57,11 +60,12 @@
 | `err_total` / `err_pct` / `err_fixed` / `err_act` / `err_alloc_overhead` | 误差分解 |
 | `l25_true_peak` / `l25_mre` / `l25_direction` | L2.5 融合感知仿真 |
 | `l3_true_peak` / `l3_mre` / `l3_direction` | L3 Scheduler 仿真 |
+| `l25_fusion_true_peak` / `l25_fusion_mre` | L2.5 fusion-only 消融字段（横向实验中完整输出） |
 
 **关键特征**:
 - G1 策略（eager）：有运行时数据，**无仿真数据**（不经过 torch.compile）
-- G2 aot_eager 策略：L2 MRE ~1-3%（极高精度），无 L2.5/L3
-- G2/G3 inductor 策略：L2 MRE ~28-38%（不建模 fusion），L2.5 MRE ~8-12%，L3 MRE ~5-7%
+- G2 aot_eager 策略：输出 L2，通常无 L2.5/L3
+- G2/G3 inductor 策略：输出 L2/L2.5/L3。2026-04-23 修复后旧 CSV 的 L2.5 MRE 不再作为论文结论，需要在 GPU 可见环境下重跑
 
 ### ex_peak_phase.csv — 峰值阶段分析
 
@@ -104,9 +108,29 @@
 - aot_eager 策略：L2 MRE 随架构差异较大（GPT-2 较高，LLaMA 较低）
 - inductor 策略：L2.5 和 L3 显著优于 L2
 
+### ex_horizontal_comparison.csv — 横向方法对比
+
+**quick 配置**: GPT-2 4L/256H, B=4, S=128。
+**paper 配置**: GPT-2/LLaMA/Mistral 放大配置, B=8, S=512, Adam(fused=True)。
+
+| 字段 | 含义 |
+|------|------|
+| `model` / `strategy` / `batch` / `seq` | 实验配置 |
+| `rt_true_peak` / `rt_fw_peak` / `rt_bw_peak` / `rt_opt_peak` | Runtime ground truth |
+| `l1_true_peak` / `l1_mre` / `l1_direction` | L1 config formula |
+| `shape_sum_true_peak` / `shape_sum_mre` / `shape_sum_direction` | ShapeSum_graph baseline |
+| `shape_sum_fw_bytes` / `shape_sum_bw_bytes` | 非 view compute tensor shape bytes 总和 |
+| `l2_true_peak` / `l2_mre` / `l2_direction` | L2 live-range |
+| `l25_fusion_true_peak` / `l25_fusion_mre` | L2.5 fusion-only |
+| `l25_safe_true_peak` / `l25_safe_mre` | L2.5 fusion + safe reuse |
+| `l3_true_peak` / `l3_mre` | L3 Scheduler |
+| `l25_fw_reuses` / `l25_bw_reuses` / `has_recomputation` | safe-reuse 与重计算诊断 |
+
+`ShapeSum_graph` 只是 naive shape-inference baseline：非 view tensor shape bytes 总和 + static base，不做 live-range，不宣称复现 DNNMem/LLMem/xMem。
+
 ---
 
-## 三、论文图表 (F1-F7) 详细说明
+## 三、论文图表 (F1-F9) 详细说明
 
 ### F1: Memory Composition — `F1_composition.{pdf,png}`
 
@@ -140,35 +164,51 @@
 - **读图方法**: 柱子越矮 = 误差越小。aot_eager 策略 L2 已足够准确；inductor 策略需要 L2.5/L3 才能达到可用精度
 - **论文用途**: §5.1 精度分析的核心数据图
 
-### F5: Peak Phase Heatmap — `F5_peak_phase_{strategy}.{pdf,png}`
+### F5: Peak Phase Heatmap — `F5_peak_phase_merged.{pdf,png}`
 
 - **类型**: Heatmap，X = batch size，Y = optimizer
-- **每策略一张**: eager / inductor(b=1.0) / inductor(b=0.0) / ac+inductor（共 4 策略 × 2 格式 = 8 文件）
+- **布局**: 多策略 merged 子图
 - **数据来源**: `ex_peak_phase.csv`
 - **含义**: 以离散颜色展示每个 batch×optimizer 组合的峰值阶段（FW/BW/OPT）
 - **颜色**: FW = 蓝色, BW = 橙色, OPT = 红色
 - **读图方法**: 红色区域（OPT 瓶颈）集中在 Adam + 小 batch。Adam(fused) 的 OPT 红色通常消失。AC 策略整体偏 FW
 - **论文用途**: §5.2 核心图，展示"何时 OPT 成为瓶颈"的完整矩阵
 
-### F6: Phase Stack — `F6_phase_stack_{strategy}.{pdf,png}`
+### F6: Phase Stack — `F6_phase_stack_merged.{pdf,png}`
 
 - **类型**: Stacked Bar Chart，按 batch×optimizer 分组
-- **每策略一张**: eager / inductor(b=1.0)（共 2 策略 × 2 格式 = 4 文件）
+- **布局**: 代表性策略 merged 子图
 - **数据来源**: `ex_peak_phase.csv`
 - **含义**: 将 fw_peak / bw_peak / opt_peak 堆叠展示，直观看三阶段的绝对大小和相对比例
 - **读图方法**: 三层堆叠中最高的色块 = 该阶段占据的峰值份额。batch 增大 → FW 层增厚；SGD → OPT 层很薄
 - **论文用途**: §5.2 辅助图，展示峰值的阶段组成变化趋势
 
-### F7: Model Heatmap — `F7_model_heatmap_{level}.{pdf,png}`
+### F7: Model Heatmap — `F7_model_heatmap_merged.{pdf,png}`
 
 - **类型**: Heatmap，X = 策略，Y = 模型
-- **每仿真层一张**: l2 / l25 / l3（共 3 层 × 2 格式 = 6 文件）
+- **布局**: l2 / l25 / l3 多层 merged 子图
 - **数据来源**: `ex_model_generalization.csv`
 - **含义**: 以颜色深浅展示每个模型×策略组合在指定仿真层级下的 MRE（%）
 - **颜色**: 浅 = 低 MRE = 高精度，深 = 高 MRE
 - **单元格标注**: MRE 百分比数值
 - **读图方法**: 比较同一行（同模型）不同策略的精度差异；比较同一列（同策略）不同模型的精度差异
 - **论文用途**: §5.3 核心图，证明仿真精度的架构通用性
+
+### F8: Horizontal Methods — `F8_horizontal_methods.{pdf,png}`
+
+- **类型**: Horizontal Bar Chart
+- **数据来源**: `ex_horizontal_comparison.csv`
+- **含义**: 汇总 L1 / ShapeSum / L2 / L2.5 fusion-only / L2.5 safe-reuse / L3 的平均 MRE
+- **读图方法**: 越短越准确；ShapeSum 是 naive baseline，用于说明 live-range 的必要性
+- **论文用途**: §5.4 横向方法对比，补足"只纵向比较本方法层级"的不足
+
+### F9: L2.5 Ablation — `F9_l25_ablation.{pdf,png}`
+
+- **类型**: Scatter Ablation Chart
+- **数据来源**: `ex_horizontal_comparison.csv`
+- **含义**: 对每个策略展示 L2 → fusion-only → safe-reuse → L3 的误差变化
+- **读图方法**: 检查 fusion 与 safe reuse 各自贡献，并观察 L3 是否进一步贴近 Runtime
+- **论文用途**: §5.4 消融实验，解释 L2.5 的两个组成部分
 
 ---
 
@@ -180,7 +220,8 @@
 | §5.1 仿真精度验证 | F2, F3, F4 | ex_sim_accuracy.csv |
 | §5.2 峰值阶段分析 | F5, F6 | ex_peak_phase.csv |
 | §5.3 多模型通用性 | F7 (l2, l25, l3) | ex_model_generalization.csv |
-| §5.4 讨论 — 时间-内存权衡 | F2 (Pareto 子图) | ex_sim_accuracy.csv |
+| §5.4 横向方法对比与消融 | F8, F9 | ex_horizontal_comparison.csv |
+| §5.5 讨论 — 时间-内存权衡 | F2 (Pareto 子图) | ex_sim_accuracy.csv |
 
 ### 论文正文中引用格式建议
 

@@ -4,6 +4,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
+from toolkit.simulation.graph_estimator import estimate_graph_peak
 from toolkit.utils import is_view_node
 
 
@@ -30,6 +31,22 @@ def test_getitem_is_view():
 
     assert getitem_nodes
     assert all(is_view_node(node) for node in getitem_nodes)
+
+
+def test_getitem_output_pins_tuple_producing_base():
+    def fn(x):
+        out = torch.ops.aten.native_layer_norm.default(x, [x.shape[-1]], None, None, 1e-5)
+        return out[0]
+
+    gm = _trace_fake(fn, torch.randn(2, 4))
+    result = estimate_graph_peak(gm, pin_output_inputs=True)
+    freed = {
+        event["node"]
+        for event in result["timeline"]
+        if event["event"] == "free"
+    }
+
+    assert not any("native_layer_norm" in name for name in freed)
 
 
 def test_actual_alloc_not_view():

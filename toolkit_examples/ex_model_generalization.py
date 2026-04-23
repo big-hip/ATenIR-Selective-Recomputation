@@ -218,6 +218,11 @@ def main():
                         cap, m_sim,
                         optimizer_cls=OPTIMIZER_CLS,
                         fused_optimizer=FUSED_OPTIMIZER,
+                        has_recomputation=(
+                            True if (wrapping in ("ac", "sac")
+                                     or (budget is not None and budget < 0.5))
+                            else None
+                        ),
                     )
                     l2_peak = est["true_peak"]
                     val_l2 = validate(est, rt)

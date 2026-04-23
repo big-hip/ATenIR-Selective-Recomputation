@@ -46,5 +46,8 @@ run-phase: ## 实验 2: batch×optimizer 峰值阶段分析（~15min）
 run-gen: ## 实验 3: 多模型通用性验证（~10min）
 	PYTHONPATH=$(CURDIR) python toolkit_examples/ex_model_generalization.py
 
-run-figs: ## 生成论文图表 F1-F7（需先跑实验 1-3）
+run-horizontal: ## 实验 4: 横向仿真方法对比（quick: ARGS=--quick）
+	PYTHONPATH=$(CURDIR) python toolkit_examples/ex_horizontal_comparison.py $(ARGS)
+
+run-figs: ## 生成论文图表 F1-F9（需先跑实验 1-4）
 	PYTHONPATH=$(CURDIR) python toolkit_examples/generate_paper_figures.py

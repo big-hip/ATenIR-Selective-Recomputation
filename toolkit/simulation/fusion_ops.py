@@ -1,10 +1,9 @@
 """Operator classification for fusion-aware memory estimation (L2.5).
 
-Inductor fuses consecutive pointwise/reduction ops into single Triton kernels,
-eliminating intermediate tensor allocations.  This module classifies ATen IR ops
-into *extern* (non-fusable, e.g. mm/bmm/sdpa) and *fusable* (pointwise,
-reduction, elementwise) categories, mirroring the classification that Inductor's
-Scheduler performs internally.
+Inductor fuses many pointwise ops into Triton kernels, eliminating intermediate
+tensor allocations.  This module classifies ATen IR ops into *extern*
+(non-fusable, e.g. mm/bmm/sdpa), *fusable* (a conservative allowlist of simple
+pointwise ops), and conservative barriers (unknown/materializing ops).
 
 The EXTERN_OPS set is based on PyTorch 2.6.0 torch._inductor internals:
 - ir.ExternKernel subclasses handle CUBLAS / cuDNN / Flash-Attention ops
@@ -20,6 +19,21 @@ import torch.fx as fx
 # and cannot be fused with neighboring pointwise ops.
 
 EXTERN_OPS: set = set()
+FUSABLE_OPS: set = set()
+
+
+def _add_overload(target_set: set, packet, overload: str) -> None:
+    if packet is None:
+        return
+    op = getattr(packet, overload, None)
+    if op is not None:
+        target_set.add(op)
+
+
+def _add_packet_overloads(target_set: set, aten, name: str, overloads: tuple[str, ...]) -> None:
+    packet = getattr(aten, name, None)
+    for overload in overloads:
+        _add_overload(target_set, packet, overload)
 
 
 def _populate_extern_ops() -> None:
@@ -76,6 +90,51 @@ def _populate_extern_ops() -> None:
                 EXTERN_OPS.add(op_or_packet)
 
 
+def _populate_fusable_ops() -> None:
+    """Lazily build a conservative pointwise allowlist.
+
+    Unknown ops deliberately default to non-fusable.  This prevents L2.5 from
+    over-eliminating allocations for materializing ops such as embedding/gather,
+    clone, random ops, scatter, and layout-changing kernels.
+    """
+    if FUSABLE_OPS:
+        return
+
+    aten = torch.ops.aten
+
+    # Unary pointwise ops.
+    for name in (
+        "abs", "acos", "asin", "atan", "ceil", "cos", "cosh", "erf", "erfc",
+        "exp", "expm1", "floor", "frac", "log", "log10", "log1p", "log2",
+        "neg", "reciprocal", "relu", "round", "rsqrt", "sigmoid", "sign",
+        "sin", "sinh", "sqrt", "tan", "tanh", "trunc",
+    ):
+        _add_packet_overloads(FUSABLE_OPS, aten, name, ("default",))
+
+    # Activation-like pointwise ops commonly present after decomposition.
+    for name in ("gelu", "silu", "hardsigmoid", "hardswish", "leaky_relu"):
+        _add_packet_overloads(FUSABLE_OPS, aten, name, ("default",))
+
+    # Binary / scalar pointwise ops.
+    for name in ("add", "sub", "mul", "div", "pow", "maximum", "minimum"):
+        _add_packet_overloads(
+            FUSABLE_OPS, aten, name,
+            ("Tensor", "Scalar", "Tensor_Scalar", "Scalar_Tensor"),
+        )
+
+    # Comparisons and masks are pointwise and safe to keep in fusion groups.
+    for name in ("eq", "ne", "lt", "le", "gt", "ge"):
+        _add_packet_overloads(FUSABLE_OPS, aten, name, ("Tensor", "Scalar"))
+    _add_packet_overloads(FUSABLE_OPS, aten, "where", ("self",))
+
+    # Backward pointwise kernels after decomposition.
+    for name in (
+        "threshold_backward", "sigmoid_backward", "tanh_backward",
+        "gelu_backward", "silu_backward",
+    ):
+        _add_packet_overloads(FUSABLE_OPS, aten, name, ("default",))
+
+
 def is_extern_op(node: fx.Node) -> bool:
     """Return True if *node* corresponds to an Inductor ExternKernel op."""
     _populate_extern_ops()
@@ -83,9 +142,17 @@ def is_extern_op(node: fx.Node) -> bool:
 
 
 def is_fusable_op(node: fx.Node) -> bool:
-    """Return True if *node* is a compute op that Inductor would lower to a
-    fusable Triton kernel (pointwise / reduction)."""
+    """Return True if *node* is in the conservative pointwise allowlist."""
     if node.op not in ("call_function", "call_method"):
         return False
     _populate_extern_ops()
-    return getattr(node, "target", None) not in EXTERN_OPS
+    _populate_fusable_ops()
+    target = getattr(node, "target", None)
+    return target in FUSABLE_OPS and target not in EXTERN_OPS
+
+
+def is_fusion_barrier(node: fx.Node) -> bool:
+    """Return True for materializing ops that should break L2.5 fusion groups."""
+    if node.op not in ("call_function", "call_method"):
+        return True
+    return is_extern_op(node) or not is_fusable_op(node)

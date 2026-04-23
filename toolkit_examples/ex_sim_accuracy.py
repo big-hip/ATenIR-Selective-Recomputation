@@ -199,6 +199,11 @@ def main():
                     cap, m_sim,
                     optimizer_cls=OPTIMIZER_CLS,
                     fused_optimizer=FUSED_OPTIMIZER,
+                    has_recomputation=(
+                        True if (wrapping in ("ac", "sac")
+                                 or (budget is not None and budget < 0.5))
+                        else None
+                    ),
                 )
                 val = validate(l2, rt)
                 l25_stub = make_level_stub(l2, "l25")

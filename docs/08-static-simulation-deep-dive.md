@@ -23,8 +23,9 @@
 |------|------|------|-----------------|----------------|------|
 | **L1** | Config 公式法 | 模型配置 | MRE ~15-25% | — | 快速粗估、选型 |
 | **L2** | FX 图事件驱动 | fw_gm / bw_gm | **MRE 1-7%** | MRE 28-38% | 精确仿真 (aot_eager) |
-| **L2.5** | 融合感知图遍历 | fw_gm / bw_gm + fusion groups | — | **MRE 8-12%** | 近似建模 fusion |
-| **L3** | Inductor Scheduler | Scheduler 编译产物 | — | **MRE 5-7%** | 精确建模 fusion |
+| **ShapeSum_graph** | naive shape 总和 | fw_gm / bw_gm | 待重跑 | 待重跑 | 横向基线：不做 live-range |
+| **L2.5** | 融合感知 + safe reuse | fw_gm / bw_gm + fusion groups | — | 待重跑 | 保守建模 fusion / reuse |
+| **L3** | Inductor Scheduler | Scheduler 编译产物 | — | 待重跑 | Scheduler 视角 |
 
 ---
 
@@ -39,17 +40,17 @@
        │        ││            ││         │
  peak→ │ ▓▓▓▓▓▓ ││ ▓▓▓▓▓▓▓▓▓ ││ ▓▓▓▓▓  │
        │ ▓▓▓▓▓▓ ││ ▓▓▓▓▓▓▓▓▓ ││ ▓▓▓▓▓  │
-       │ ░░░░░░ ││ ░░░░░░░░░ ││ ░░░░░  │ ← static_base (param + optim_states)
+       │ ░░░░░░ ││ ░░░░░░░░░ ││ ░░░░░  │ ← static_base (param + buffers + optim_states)
        └────────┘└───────────┘└────────┘
 
  ▓ = 动态部分（激活/梯度/临时内存）
- ░ = 固定部分（参数 + 优化器状态）
+ ░ = 固定部分（参数 + buffer + 优化器状态）
 ```
 
 四峰值公式：
 
 ```python
-static_base = param_bytes + optim_bytes           # 参数 + 优化器状态（SGD=0倍，Adam=2倍）
+static_base = param_bytes + buffer_bytes + optim_bytes  # 参数 + buffer + 优化器状态
 
 fw_peak   = static_base + fw_activation_peak      # 前向：基座 + 激活内存峰值
 bw_peak   = static_base + bw_activation_peak       # 反向：基座 + 激活（梯度已含在图内）
@@ -246,7 +247,7 @@ bw_result = estimate_graph_peak(bw_gm, pin_output_inputs=True)   # BW: 保留梯
 - **FW 图**: `pin_output_inputs=True` → saved activations 不释放 → 反映"FW 结束时所有 saved acts 仍然活着"
 - **BW 图**: `pin_output_inputs=True` → 梯度输出（及其 view-base）不释放 → 反映梯度在 BW 中逐步积累
 
-> **view-base pin 机制**：被 pin 的 view 节点会自动回溯到拥有 storage 的 base 节点并一并 pin。详见 `11-l2-accuracy-improvement.md` §三.1。
+> **view-base pin 机制**：被 pin 的 view 节点会自动回溯到拥有 storage 的 base 节点并一并 pin。当前实现会递归检查 input meta 中的 tuple/list，因此 `native_layer_norm -> getitem -> output/consumer` 这类 tuple-producing view 链不会提前释放 base。详见 `11-l2-accuracy-improvement.md` §三.1。
 
 ### 4.3 `estimate_training_peak()` — 训练步峰值拼装（第 97-179 行）
 
@@ -255,17 +256,20 @@ def estimate_training_peak(fw_gm, bw_gm, model, optimizer_cls=Adam, fused_optimi
     param_bytes = count_unique_params(model)       # 遍历 model._parameters 去重
     grad_bytes = param_bytes
     optim_bytes = param_bytes * optim_mul           # Adam=2x, SGD=0x
+    buffer_bytes = count_unique_buffers(model)
 
     fw_result = estimate_graph_peak(fw_gm, pin_output_inputs=True)
     bw_result = estimate_graph_peak(bw_gm, pin_output_inputs=True)
 
     fw_graph_peak = fw_result["peak_bytes"]         # FW 图内激活峰值
     bw_graph_peak = bw_result["peak_bytes"]         # BW 图内激活峰值（含梯度）
+    fw_graph_peak_net = fw_result["peak_net_bytes"] # 扣除与 static_base 重叠的 graph input
+    bw_graph_peak_net = bw_result["peak_net_bytes"] # 扣除 forwarded primals 重叠
 
-    static_base = param_bytes + optim_bytes
+    static_base = param_bytes + optim_bytes + buffer_bytes
 
-    fw_peak  = static_base + fw_graph_peak
-    bw_peak  = static_base + bw_graph_peak           # 梯度已含在 bw_graph_peak 中
+    fw_peak  = static_base + fw_graph_peak_net
+    bw_peak  = static_base + bw_graph_peak_net       # 梯度已含在 bw_graph_peak 中
     opt_peak = static_base + grad_bytes + opt_temp
     fwbw_peak = max(fw_peak, bw_peak)
     true_peak = max(fw_peak, bw_peak, opt_peak)
@@ -540,17 +544,20 @@ Inductor 后端将连续的 pointwise/reduction 算子融合成单个 Triton ker
 
 ```python
 EXTERN_OPS = {aten.mm, aten.bmm, aten.addmm, ...}  # 调用 CUBLAS/cuDNN，不参与融合
+FUSABLE_OPS = {aten.add, aten.mul, aten.relu, ...} # 保守 allowlist：简单 pointwise/unary/binary
 
 def is_fusable_op(node) -> bool:
-    """非 extern 的 call_function 节点视为可融合。"""
+    """只有显式 allowlist 内的 call_function/call_method 节点才可融合。"""
 ```
+
+Unknown/materializing ops 默认是 barrier。embedding/gather/scatter/clone/random/layout-changing ops 和复杂 reduction 暂不消除，优先避免 L2.5 低估危险场景。
 
 ### 11.3 融合组识别 (`fusion_groups.py`)
 
 ```python
 def identify_fusion_groups(gm) -> list[FusionGroup]:
-    """贪心拓扑扫描：连续的 fusable ops 合并为一组。
-    组的边界在 extern op 或 graph 边界处切断。"""
+    """贪心拓扑扫描：只合并 allowlist fusable producer/consumer。
+    extern/unknown/materializing op 都作为 barrier。"""
 ```
 
 每个 FusionGroup 包含：
@@ -561,13 +568,17 @@ def identify_fusion_groups(gm) -> list[FusionGroup]:
 ### 11.4 融合感知估算
 
 ```python
-estimate_graph_peak(gm, fusion_aware=True, optimize_order=True)
+estimate_graph_peak(gm, fusion_aware=True, simulate_inplace=True, no_reuse_nodes=protected)
 ```
 
 - `fusion_aware=True`: 识别融合组，internal 节点分配为 0
-- `optimize_order=True`: 贪心调度 — 优先执行释放内存最多的节点，最小化峰值
+- `simulate_inplace=True`: 仅在严格安全条件下复用同尺寸 dying input buffer
+- `no_reuse_nodes`: 禁止复用 placeholder、graph input、参数/buffer alias、pinned output base
+- `has_recomputation=True` 时，BW 图禁用 safe reuse，只保留 fusion elimination
 
-L2.5 将 inductor MRE 从 28-38% 降低到 8-12%。
+`estimate_inductor_training_peak()` 同时输出 `l25_fusion_*`（fusion-only）和 `l25_*`（fusion + safe reuse）两套字段，便于 F9 消融。
+
+旧数据中 L2.5 曾将 inductor MRE 从 28-38% 降低到 8-12%，但那一版使用了过宽的"非 extern 即 fusable"口径。当前修复后必须重跑 `ex_sim_accuracy.py`、`ex_model_generalization.py` 和 `ex_horizontal_comparison.py` 才能引用新 MRE。
 
 ---
 
@@ -593,12 +604,12 @@ def capture_inductor_graphs(model, input_ids, loss_fn, *, budget=None):
 ```python
 def estimate_inductor_training_peak(capture_result, model, ...):
     # L2: estimate_training_peak(fw_gm, bw_gm, model)
-    # L2.5: estimate_graph_peak(fw_gm, fusion_aware=True) + min(sched_bw, fusion_bw)
-    # L3: static_base + max(sched_fw_peak, sched_bw_peak + grad_bytes)
+    # L2.5: independent fusion-only + fusion/safe-reuse graph paths
+    # L3: static_base + sched_fw_peak / sched_bw_peak, plus graph-input diagnostics
     # 返回包含三层结果的 dict
 ```
 
-L3 将 inductor MRE 从 8-12% 进一步降低到 5-7%。
+L3 不再参与 L2.5 的 `min()` 逻辑；它是独立的 Scheduler 口径。当前结果会记录 `l3_fw_graph_input_bytes`、`l3_bw_graph_input_bytes` 和 `l3_static_base_added`，用于在 GPU 可见环境下判断 Scheduler peak 是否已包含某些 graph input buffer，避免后续发生 `static_base + sched_peak` 双计。
 
 ---
 
@@ -615,8 +626,8 @@ L3 将 inductor MRE 从 8-12% 进一步降低到 5-7%。
 | Saved activations | ✅ pin | ✅ pin | ✅ |
 | Optimizer 临时内存 | ✅ foreach Adam | ✅ | ✅ |
 | Weight tying | ✅ `data_ptr()` | ✅ | ✅ |
-| Kernel fusion | ❌ | ✅ 近似 | ✅ 精确 |
-| 执行顺序优化 | ❌ | ✅ 贪心 | ✅ Scheduler |
+| Kernel fusion | ❌ | ✅ 保守近似 | ✅ Scheduler 内部 |
+| Buffer reuse | ❌ | ✅ 保守 safe reuse | ✅ Scheduler/代码生成 |
 
 ### 13.2 未建模（贡献残余 MRE）
 
@@ -658,8 +669,9 @@ estimate_training_peak(fw_gm, bw_gm, model)
 # ====== L2 + L2.5 + L3 三层仿真 ======
 estimate_inductor_training_peak(capture_result, model)
     ├── L2: estimate_training_peak(fw_gm, bw_gm, model)
-    ├── L2.5: estimate_graph_peak(fw_gm, fusion_aware=True) + min(sched_bw, fusion_bw)
-    ├── L3: static_base + sched_peaks
+    ├── L2.5 fusion-only: estimate_graph_peak(..., fusion_aware=True, simulate_inplace=False)
+    ├── L2.5 safe-reuse: estimate_graph_peak(..., fusion_aware=True, simulate_inplace=True)
+    ├── L3: static_base + sched_peaks + graph-input diagnostics
     └── → {l2_*, l25_*, l3_*}
 
 # ====== 运行时验证 ======

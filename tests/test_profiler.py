@@ -6,7 +6,7 @@ import torch.nn as nn
 
 from toolkit.capture import capture_graphs
 from toolkit.models import ModelRegistry
-from toolkit.profiler import StepResult, measure_phased, measure_step, validate
+from toolkit.profiler import PhaseResult, StepResult, analyze_error_sources, measure_phased, measure_step, validate
 import toolkit.profiler.step_profiler as step_profiler_module
 
 
@@ -197,6 +197,41 @@ def test_validate_defaults_to_compiled():
     assert result.run_mode == "compiled"
     assert result.direction == "over"
     assert result.breakdown["runtime_base"] == 60
+
+
+def test_analyze_error_sources_uses_buffer_and_absolute_phase_peaks():
+    runtime_result = PhaseResult(
+        name="runtime",
+        fw_peak=100,
+        bw_peak=150,
+        opt_peak=130,
+        after_fw=90,
+        after_bw=120,
+        after_opt=120,
+        base_allocated=60,
+        overall_peak=150,
+        activation_delta=90,
+        fw_ms=0.3,
+        bw_ms=0.4,
+        opt_ms=0.3,
+        step_ms=1.0,
+    )
+    static_result = {
+        "true_peak": 170,
+        "fw_peak": 110,
+        "bw_peak": 170,
+        "opt_peak": 125,
+        "param_bytes": 20,
+        "buffer_bytes": 5,
+        "grad_bytes": 20,
+        "optimizer_bytes": 40,
+    }
+
+    result = analyze_error_sources(static_result, runtime_result)
+
+    assert result["sources"][0] == ("fixed (param+optim+buffer) vs base", 5)
+    assert result["sources"][1] == ("activation phase peak error", 20)
+    assert result["phase_errors"] == {"fw_peak": 10, "bw_peak": 20, "opt_peak": -5}
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires GPU")

@@ -72,6 +72,19 @@ def test_pointwise_not_extern():
         assert op not in EXTERN_OPS, f"{op} should not be extern"
 
 
+def test_unknown_materializing_op_not_fusable():
+    def fn(x, idx):
+        return torch.index_select(x, 0, idx)
+
+    gm = _trace(fn, torch.randn(4, 4), torch.tensor([0, 2]))
+    index_node = next(
+        n for n in gm.graph.nodes
+        if n.op == "call_function" and n.target == torch.ops.aten.index_select.default
+    )
+    assert not is_extern_op(index_node)
+    assert not is_fusable_op(index_node)
+
+
 def test_is_extern_op_on_nodes():
     """is_extern_op correctly classifies mm vs add in a traced graph."""
     def fn(x, y):

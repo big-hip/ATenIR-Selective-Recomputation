@@ -25,7 +25,7 @@ import torch.fx as fx
 
 from toolkit.utils import is_view_node
 
-from .fusion_ops import is_extern_op
+from .fusion_ops import is_extern_op, is_fusable_op
 
 
 def identify_fusion_groups(
@@ -64,15 +64,15 @@ def identify_fusion_groups(
         if node not in node_size:
             continue
 
-        if is_extern_op(node):
-            # Extern ops are fusion barriers — each gets its own group
+        if not is_fusable_op(node):
+            # Extern/unknown ops are fusion barriers — each gets its own group
             group_id[node] = next_gid
             next_gid += 1
         else:
             # Fusable op: try to join a producer's fusable group
             producer_groups: set[int] = set()
             for inp in node.all_input_nodes:
-                if inp in group_id and not is_extern_op(inp):
+                if inp in group_id and is_fusable_op(inp):
                     producer_groups.add(group_id[inp])
 
             if len(producer_groups) == 1:
@@ -91,8 +91,8 @@ def identify_fusion_groups(
     internal: Set[fx.Node] = set()
 
     for node, gid in group_id.items():
-        if is_extern_op(node):
-            continue  # extern outputs always materialize
+        if not is_fusable_op(node):
+            continue  # barriers always materialize
         if node in output_inputs:
             continue  # pinned as graph output
 
@@ -164,7 +164,7 @@ def fusion_group_stats(
     groups_set = set(group_id.values())
     extern_groups = set()
     for node, gid in group_id.items():
-        if is_extern_op(node):
+        if not is_fusable_op(node):
             extern_groups.add(gid)
 
     group_sizes = Counter(group_id.values())
