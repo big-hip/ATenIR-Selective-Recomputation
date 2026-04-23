@@ -14,7 +14,7 @@
 
 ---
 
-## 环境
+## 环境安装
 
 | 依赖 | 版本 |
 |------|------|
@@ -22,15 +22,25 @@
 | transformers | 4.35.2 |
 | Python | ≥ 3.10 |
 
+推荐直接使用本地 conda 环境和 `requirements.txt` 复现。
+
 ```bash
-# conda (推荐)
+# 1. 创建并激活环境
+conda create -n torch2.6-gpu python=3.10 -y
 conda activate torch2.6-gpu
+
+# 2. 安装依赖
 pip install -r requirements.txt
 
-# Docker
-docker compose up --rm        # 一键运行 Demo
-docker compose run --rm atenir bash  # 交互式终端
+# 3. 验证安装
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+PY
 ```
+
+`requirements.txt` 默认使用 PyTorch CUDA 12.4 wheel 源。若机器 CUDA 环境不同，按 PyTorch 官网命令替换其中的 `torch` 安装方式即可，其余依赖保持不变。
 
 ---
 
@@ -39,6 +49,9 @@ docker compose run --rm atenir bash  # 交互式终端
 ```bash
 # 快速 Demo: 重计算 IR 对比 + 仿真验证（GPT-2, <20s）
 python toolkit_examples/ex_quick_demo.py
+
+# 快速测试：跳过 Inductor/Triton 慢测试
+python -m pytest tests/ -x -q -m "not inductor"
 
 # Demo: L1/L2 静态估算（3 模型，~30s）
 python toolkit_examples/ex1_multi_model_capture.py
@@ -55,7 +68,7 @@ python toolkit_examples/ex_model_generalization.py
 # 生成论文图表（F0-F9, PNG）
 python toolkit_examples/generate_paper_figures.py
 
-# 运行全部测试
+# 运行全部测试（含 Inductor/Triton，首次编译较慢）
 python -m pytest tests/ -x -q
 ```
 
@@ -110,8 +123,6 @@ ATenIR-Selective-Recomputation/
 ├── tests/                          # 测试 (10 文件, 95 tests)
 ├── docs/                           # 项目文档 (18 篇)
 ├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml
 └── Makefile
 ```
 

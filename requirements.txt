@@ -1,21 +1,32 @@
-# ─── ATenIR-Selective-Recomputation 依赖 ─────────────────────────
+# Runtime and thesis-reproduction dependencies.
+#
+# Recommended:
+#   conda create -n torch2.6-gpu python=3.10 -y
+#   conda activate torch2.6-gpu
+#   pip install -r requirements.txt
+#
+# The extra index provides CUDA 12.4 PyTorch wheels. If your machine needs a
+# different CUDA build, replace the torch install source according to the
+# official PyTorch command and keep the remaining package pins unchanged.
 
-# 安装示例（清华源）:
-#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple/
-# PyTorch ≥ 2.6 + CUDA 12.4 — 通过 conda / Docker 基础镜像安装，不在此指定
-# 安装: pip install -r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# PyTorch / compiler stack
+torch==2.6.0
+triton>=3.2,<3.4
 
 # 模型
 transformers==4.35.2
 huggingface_hub>=0.16.4,<1.0
 tokenizers>=0.14,<0.19
 
-# 图算法（min-cut 分区器依赖）
-networkx>=3.0
-
-# 输出与可视化
+# 数值与图表
+numpy>=1.24
 matplotlib>=3.7
 tabulate>=0.9
+
+# 图算法（min-cut 分区器依赖）
+networkx>=3.0
 
 # 开发 / 测试
 pytest>=7.0

@@ -92,5 +92,5 @@
 | v6.1 | 2025-04-19 | 代码清理 + 审查修复：bw_peak 一致性、output 测试、stale ref 清除 |
 | v6.2 | 2025-04-20 | 脚本合并 (ex1-ex8 → 3 脚本) + 论文图表系统 (F1-F7) + TF32/警告管理 |
 | v7 | 2025-04-20 | 文档全面整理：按代码最终状态重写 docs/ + plans/，论文可直接引用 |
-| **v7.1** | **2025-04-21** | **项目整理：README/requirements/Docker/Makefile 对齐实际代码，清理诊断脚本** |
+| **v7.1** | **2025-04-21** | **项目整理：README/requirements/Makefile 对齐实际代码，清理诊断脚本** |
 | **v7.2** | **2026-04-23** | **仿真语义修复：tuple/list view-base pin、保守 L2.5 allowlist、安全 reuse、ShapeSum 横向基线与 F8/F9** |

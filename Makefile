@@ -1,33 +1,19 @@
-.PHONY: build run shell clean test help
-
-IMAGE_NAME := atenir-selective-recomputation
+.PHONY: help setup-local test test-fast run-quick run-demo run-sim run-phase run-gen run-horizontal run-figs
 
 help: ## 显示帮助信息
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
-# ── Docker ──────────────────────────────────────────────────────────────────
-
-build: ## 构建 Docker 镜像
-	docker compose build
-
-run: build ## 一键运行 Demo（L1/L2 多模型对比）
-	docker compose up --rm
-
-shell: build ## 进入容器交互式终端
-	docker compose run --rm atenir bash
-
-clean: ## 清理 Docker 镜像
-	docker compose down --rmi local 2>/dev/null || true
-
 # ── 本地开发 ────────────────────────────────────────────────────────────────
 
 setup-local: ## 本地安装依赖（需先激活 conda/venv）
-	pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 	pip install -r requirements.txt
 
 test: ## 运行全部测试（95 tests）
 	PYTHONPATH=$(CURDIR) python -m pytest tests/ -x -q
+
+test-fast: ## 快速测试（跳过 Inductor/Triton 慢测试）
+	PYTHONPATH=$(CURDIR) python -m pytest tests/ -x -q -m "not inductor"
 
 # ── 实验脚本 ────────────────────────────────────────────────────────────────
 
