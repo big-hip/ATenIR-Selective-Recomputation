@@ -14,7 +14,7 @@ Usage::
     with paper_style():
         fig, ax = plt.subplots(figsize=(COLUMN_SINGLE, 2.5))
         ...
-        savefig_pub(fig, "output_dir/fig_name")   # saves .pdf + .png
+        savefig_pub(fig, "output_dir/fig_name")   # saves .png by default
 """
 
 from contextlib import contextmanager
@@ -35,7 +35,7 @@ LEGEND_SIZE  = 7.5
 TICK_SIZE    = 8
 ANNOT_SIZE   = 8        # minimum annotation / data-label size (≥8pt per v3)
 
-# ── Okabe-Ito palette — Nature Methods recommended, colorblind-safe ─
+# ── Muted Okabe-Ito palette — colorblind-safe, print-friendly ─────
 COLORS = {
     "blue":   "#0072B2",   # deep blue
     "orange": "#E69F00",   # orange
@@ -43,15 +43,15 @@ COLORS = {
     "green":  "#009E73",   # bluish green
     "purple": "#CC79A7",   # reddish purple / pink
     "cyan":   "#56B4E9",   # sky blue
-    "gray":   "#BDBDBD",   # neutral gray
-    "gold":   "#F0E442",   # yellow
-    "black":  "#000000",   # black
+    "gray":   "#8A8F98",   # neutral gray
+    "gold":   "#D6B656",   # muted yellow
+    "black":  "#222222",   # near-black
 }
 
 # Simulation levels — consistent triad across F3/F4
 LEVEL_COLORS = {
-    "RT":   "#555555",   # neutral dark gray — ground truth
-    "L1":   "#F0E442",
+    "RT":   "#4D4D4D",   # neutral dark gray — ground truth
+    "L1":   COLORS["gold"],
     "L2":   "#0072B2",   # deep blue
     "L2.5": "#D55E00",   # vermillion
     "L3":   "#009E73",   # green
@@ -101,10 +101,15 @@ _PAPER_RC = {
     "font.size":          FONT_SIZE,
     "axes.labelsize":     LABEL_SIZE,
     "axes.titlesize":     TITLE_SIZE,
-    "axes.titleweight":   "bold",
+    "axes.titleweight":   "semibold",
+    "axes.titlepad":      5,
     "legend.fontsize":    LEGEND_SIZE,
     "xtick.labelsize":    TICK_SIZE,
     "ytick.labelsize":    TICK_SIZE,
+    "text.color":         "#222222",
+    "axes.labelcolor":    "#222222",
+    "xtick.color":        "#333333",
+    "ytick.color":        "#333333",
     # Ticks — inward (professional convention)
     "xtick.direction":    "in",
     "ytick.direction":    "in",
@@ -119,17 +124,19 @@ _PAPER_RC = {
     # Spines — only left & bottom
     "axes.spines.top":    False,
     "axes.spines.right":  False,
-    "axes.linewidth":     0.8,
+    "axes.edgecolor":     "#4A4A4A",
+    "axes.linewidth":     0.75,
     # Grid — OFF by default (add per-figure where needed)
     "axes.grid":          False,
-    "grid.alpha":         0.25,
-    "grid.linewidth":     0.4,
+    "grid.color":         "#D7DCE2",
+    "grid.alpha":         0.45,
+    "grid.linewidth":     0.45,
     "grid.linestyle":     "-",
     "axes.axisbelow":     True,
     # Lines & markers
     "lines.linewidth":    1.2,
     "lines.markersize":   5,
-    "patch.linewidth":    0.5,
+    "patch.linewidth":    0.45,
     # Legend — frameless, clean
     "legend.frameon":     False,
     "legend.borderpad":   0.4,
@@ -141,6 +148,8 @@ _PAPER_RC = {
     "savefig.dpi":        300,
     "savefig.bbox":       "tight",
     "savefig.pad_inches": 0.03,
+    "figure.facecolor":   "white",
+    "savefig.facecolor":  "white",
 }
 
 

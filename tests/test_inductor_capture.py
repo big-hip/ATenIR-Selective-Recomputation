@@ -15,10 +15,17 @@ CUDA_AVAILABLE = torch.cuda.is_available()
 TRITON_AVAILABLE = shutil.which("ptxas") is not None
 DEVICE = "cuda" if CUDA_AVAILABLE else "cpu"
 
-requires_inductor = pytest.mark.skipif(
+_skip_without_inductor = pytest.mark.skipif(
     not CUDA_AVAILABLE or not TRITON_AVAILABLE,
     reason="requires GPU + ptxas (Triton compiler)",
 )
+
+
+def requires_inductor(fn):
+    """Mark tests that need CUDA plus Triton/Inductor compilation."""
+    return _skip_without_inductor(pytest.mark.inductor(fn))
+
+
 BATCH = 2
 SEQ = 64
 

@@ -91,7 +91,7 @@ Graph-only `act_peak` 保留为内部分析字段，不再作为最终误差来�
 
 新增脚本：
 
-- `toolkit_examples/ex_horizontal_comparison.py --quick`
+- `toolkit_examples/ex_horizontal_comparison.py --medium`
 
 方法链路：
 
@@ -110,19 +110,32 @@ Graph-only `act_peak` 保留为内部分析字段，不再作为最终误差来�
 
 ---
 
-## 四、重跑顺序
+## 四、2026-04-23 重跑结果
 
-当前会话 CUDA 不可见，因此这里只能完成非 GPU 测试；Runtime/Profile 数据需要在 GPU 可见环境下执行。
+本轮已在 GPU 可见环境下完成主要实验重跑并生成 F0-F9 PNG 图表。
+
+| 实验 | 数据文件 | 当前状态 | 关键结论 |
+|------|---------|---------|---------|
+| 12 策略仿真精度 | `ex_sim_accuracy.csv` | 已重跑 | L2/L2.5/L3 平均 MRE = 8.0% / 4.9% / 9.1% |
+| 多模型泛化 | `ex_model_generalization.csv` | 已重跑 | L2/L2.5/L3 overall 平均 MRE = 8.4% / 7.0% / 7.0% |
+| 峰值阶段 | `ex_peak_phase.csv` | 已重跑 | eager 多为 FW；Inductor 与 AC/budget 策略多为 BW；Adam 小 batch 可出现 OPT |
+| 横向方法 medium | `ex_horizontal_comparison.csv` | 已重跑 medium | L1/ShapeSum/L2/L2.5/L3 平均 MRE = 38.8% / 315.1% / 8.5% / 10.6% / 5.4% |
+
+需要注意：横向方法当前是 GPT-2 medium 配置（8L/512H, B=8, S=256），足以说明 ShapeSum baseline 和方法链路；若论文希望把 F8/F9 作为全模型强定量结论，可额外运行 paper 配置。
+
+测试状态：`pytest -m "not inductor"` 为 83 passed / 12 deselected（约 40 秒）；全量 `pytest tests/ -x -q` 为 95 passed（约 5 分 36 秒）。
+
+---
+
+## 五、推荐复现实验顺序
 
 ```bash
-conda run -n torch2.6-gpu python -m pytest tests/ -x -q -k "not inductor"
+conda run -n torch2.6-gpu python -m pytest tests/ -x -q -m "not inductor"
 conda run -n torch2.6-gpu python -m pytest tests/ -x -q
 conda run -n torch2.6-gpu python toolkit_examples/test_sim_quick.py
-conda run -n torch2.6-gpu python toolkit_examples/ex_horizontal_comparison.py --quick
+conda run -n torch2.6-gpu python toolkit_examples/ex_horizontal_comparison.py --medium
 conda run -n torch2.6-gpu python toolkit_examples/ex_sim_accuracy.py
 conda run -n torch2.6-gpu python toolkit_examples/ex_model_generalization.py
 conda run -n torch2.6-gpu python toolkit_examples/ex_peak_phase.py
 conda run -n torch2.6-gpu python toolkit_examples/generate_paper_figures.py
 ```
-
-重跑完成后，把新的 MRE 表补回本文件，并在论文中用新 CSV 替换旧数据。

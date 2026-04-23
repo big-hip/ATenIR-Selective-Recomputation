@@ -21,11 +21,13 @@
 
 | 层级 | 名称 | 输入 | 精度 (aot_eager) | 精度 (inductor) | 用途 |
 |------|------|------|-----------------|----------------|------|
-| **L1** | Config 公式法 | 模型配置 | MRE ~15-25% | — | 快速粗估、选型 |
-| **L2** | FX 图事件驱动 | fw_gm / bw_gm | **MRE 1-7%** | MRE 28-38% | 精确仿真 (aot_eager) |
-| **ShapeSum_graph** | naive shape 总和 | fw_gm / bw_gm | 待重跑 | 待重跑 | 横向基线：不做 live-range |
-| **L2.5** | 融合感知 + safe reuse | fw_gm / bw_gm + fusion groups | — | 待重跑 | 保守建模 fusion / reuse |
-| **L3** | Inductor Scheduler | Scheduler 编译产物 | — | 待重跑 | Scheduler 视角 |
+| **L1** | Config 公式法 | 模型配置 | 横向 medium 平均 MRE 38.8% | 同左 | 快速粗估、选型 |
+| **ShapeSum_graph** | naive shape 总和 | fw_gm / bw_gm | 横向 medium 平均 MRE 315.1% | 同左 | 横向基线：不做 live-range |
+| **L2** | FX 图事件驱动 | fw_gm / bw_gm | 主实验 AOT MRE 3.7% / 10.1% | 主实验 Inductor 平均 7.3% | 精确仿真 (aot_eager) |
+| **L2.5** | 融合感知 + safe reuse | fw_gm / bw_gm + fusion groups | — | 主实验平均 MRE 4.9% | 保守建模 fusion / reuse |
+| **L3** | Inductor Scheduler | Scheduler 编译产物 | — | 主实验平均 MRE 9.1%，泛化平均 7.0% | Scheduler 视角 |
+
+> 上表使用 2026-04-23 生成的 `toolkit_examples/outputs/*.csv`。F8/F9 当前来自 GPT-2 medium 横向实验（8L/512H, B=8, S=256），主实验 F2-F7 来自 LLaMA/GPT-2/Mistral 的论文配置。
 
 ---
 
@@ -578,7 +580,7 @@ estimate_graph_peak(gm, fusion_aware=True, simulate_inplace=True, no_reuse_nodes
 
 `estimate_inductor_training_peak()` 同时输出 `l25_fusion_*`（fusion-only）和 `l25_*`（fusion + safe reuse）两套字段，便于 F9 消融。
 
-旧数据中 L2.5 曾将 inductor MRE 从 28-38% 降低到 8-12%，但那一版使用了过宽的"非 extern 即 fusable"口径。当前修复后必须重跑 `ex_sim_accuracy.py`、`ex_model_generalization.py` 和 `ex_horizontal_comparison.py` 才能引用新 MRE。
+旧数据中 L2.5 曾将 inductor MRE 从 28-38% 降低到 8-12%，但那一版使用了过宽的"非 extern 即 fusable"口径。2026-04-23 重跑后，主实验中 Inductor 策略的 L2.5 平均 MRE 为 4.9%，多模型泛化实验平均 MRE 为 7.0%。当前结果更保守，也更适合作为论文口径。
 
 ---
 

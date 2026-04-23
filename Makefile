@@ -26,7 +26,7 @@ setup-local: ## 本地安装依赖（需先激活 conda/venv）
 	pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 	pip install -r requirements.txt
 
-test: ## 运行全部测试（85 tests）
+test: ## 运行全部测试（95 tests）
 	PYTHONPATH=$(CURDIR) python -m pytest tests/ -x -q
 
 # ── 实验脚本 ────────────────────────────────────────────────────────────────
@@ -46,8 +46,8 @@ run-phase: ## 实验 2: batch×optimizer 峰值阶段分析（~15min）
 run-gen: ## 实验 3: 多模型通用性验证（~10min）
 	PYTHONPATH=$(CURDIR) python toolkit_examples/ex_model_generalization.py
 
-run-horizontal: ## 实验 4: 横向仿真方法对比（quick: ARGS=--quick）
+run-horizontal: ## 实验 4: 横向仿真方法对比（quick/medium: ARGS=--quick 或 --medium）
 	PYTHONPATH=$(CURDIR) python toolkit_examples/ex_horizontal_comparison.py $(ARGS)
 
-run-figs: ## 生成论文图表 F1-F9（需先跑实验 1-4）
+run-figs: ## 生成论文图表 F0-F9（需先跑实验 1-4）
 	PYTHONPATH=$(CURDIR) python toolkit_examples/generate_paper_figures.py

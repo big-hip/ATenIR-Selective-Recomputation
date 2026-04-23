@@ -1,9 +1,10 @@
-"""Publication-quality chart functions for the thesis (F1–F9).
+"""Publication-quality chart functions for the thesis (F0–F9).
 
 Each function takes structured data and returns a matplotlib Figure.
 All honour the ``paper_style()`` context.
 
 Figure mapping:
+  F0: Method Overview Pipeline            — no CSV
   F1: Memory Composition Breakdown        — from L1 config estimation
   F2: 12-Strategy Overview + Pareto        — from ex_sim_accuracy.csv
   F3: Multi-Level Peak Comparison (RT/L2/L2.5/L3)  — from ex_sim_accuracy.csv
@@ -29,10 +30,10 @@ from __future__ import annotations
 from typing import List, Dict, Any, Optional
 from collections import OrderedDict
 
-import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Patch
+from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Patch
 
 from .pub_style import (
     COLUMN_SINGLE, COLUMN_DOUBLE, COLUMN_THESIS,
@@ -65,6 +66,173 @@ def _auto_unit(max_bytes: float):
     return MB, "MB"
 
 
+def _add_heatmap_grid(ax, n_cols: int, n_rows: int) -> None:
+    """Add thin white separators between heatmap cells."""
+    ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=0.7)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  F0: Method overview pipeline
+# ═══════════════════════════════════════════════════════════════════
+def plot_f0_method_overview(fig_width: float = COLUMN_DOUBLE) -> plt.Figure:
+    """System pipeline diagram for the method chapter.
+
+    The diagram separates pure static estimators (L1/L2/L2.5), the
+    compiler-assisted static estimator (L3), and runtime profiling.
+    """
+    fig, ax = plt.subplots(figsize=(fig_width, 4.35))
+    ax.set_xlim(-0.25, 17.15)
+    ax.set_ylim(0, 8.8)
+    ax.axis("off")
+
+    text_col = "#222222"
+    muted_col = "#545C66"
+    arrow_col = "#737B85"
+
+    def panel(x, y, w, h, title, fc="#F8FAFC", ec="#D3DAE3"):
+        patch = FancyBboxPatch(
+            (x, y), w, h,
+            boxstyle="round,pad=0.10,rounding_size=0.12",
+            facecolor=fc, edgecolor=ec, linewidth=0.85, alpha=0.98,
+            zorder=0,
+        )
+        ax.add_patch(patch)
+        ax.text(x + 0.18, y + h - 0.20, title,
+                ha="left", va="top", fontsize=6.4,
+                fontweight="semibold", color=muted_col, zorder=4)
+        return patch
+
+    def box(x, y, w, h, title, body, fc, ec=None, lw=0.9,
+            title_size=6.7, body_size=5.4):
+        if ec is None:
+            ec = fc
+        patch = FancyBboxPatch(
+            (x, y), w, h,
+            boxstyle="round,pad=0.08,rounding_size=0.10",
+            facecolor=fc, edgecolor=ec, linewidth=lw, alpha=0.98,
+            zorder=2,
+        )
+        ax.add_patch(patch)
+        ax.text(x + w / 2, y + h - 0.16, title,
+                ha="center", va="top", fontsize=title_size,
+                fontweight="semibold", color=text_col, zorder=3)
+        ax.text(x + w / 2, y + h / 2 - 0.08, body,
+                ha="center", va="center", fontsize=body_size,
+                color="#333333", linespacing=1.18, zorder=3)
+        return patch
+
+    def chip(x, y, text, fc, ec):
+        patch = FancyBboxPatch(
+            (x, y), 0.92, 0.28,
+            boxstyle="round,pad=0.04,rounding_size=0.08",
+            facecolor=fc, edgecolor=ec, linewidth=0.55, alpha=0.98,
+            zorder=4,
+        )
+        ax.add_patch(patch)
+        ax.text(x + 0.46, y + 0.14, text, ha="center", va="center",
+                fontsize=4.8, color=text_col, zorder=5)
+
+    def arrow(x1, y1, x2, y2, color=arrow_col, rad=0.0, lw=1.0):
+        ax.add_patch(FancyArrowPatch(
+            (x1, y1), (x2, y2),
+            arrowstyle="-|>", mutation_scale=8.5,
+            linewidth=lw, color=color,
+            connectionstyle=f"arc3,rad={rad}",
+            zorder=1,
+        ))
+
+    ax.text(8.5, 8.42, "ATen IR Selective Recomputation Framework",
+            ha="center", va="top", fontsize=8.4,
+            fontweight="semibold", color=text_col)
+
+    # Main capture path.
+    box(0.35, 6.15, 2.65, 1.25,
+        "Workload + Strategy",
+        "model, batch, seq\noptimizer\nAC / SAC / budget",
+        "#EEF4FA", "#9CB8D3", title_size=6.35, body_size=5.25)
+    box(3.45, 6.15, 2.50, 1.25,
+        "Unified Capture",
+        "post-grad graph\ncapture hooks",
+        "#F6F7F9", "#B8BDC4", title_size=6.35, body_size=5.0)
+    chip(3.82, 6.24, "AOT", "#EAF3FA", "#9CB8D3")
+    chip(4.90, 6.24, "Inductor", "#EAF7F0", "#92B8A8")
+    box(6.55, 6.15, 2.50, 1.25,
+        "Graph Metadata",
+        "FW / BW ATen IR\nFakeTensor meta\nstorage alias info",
+        "#F6F7F9", "#B8BDC4", title_size=6.35, body_size=5.0)
+
+    arrow(3.00, 6.78, 3.45, 6.78)
+    arrow(5.95, 6.78, 6.55, 6.78)
+
+    # Static estimation path.
+    panel(3.20, 3.35, 9.45, 2.35, "Static and Compiler-Assisted Estimators")
+    cards = [
+        ("L1", "config\nformula", "#F7E6A7", "#D6B656"),
+        ("ShapeSum", "shape sum\nno live range", "#ECEFF3", COLORS["gray"]),
+        ("L2", "live range\nview alias", "#DCECF7", LEVEL_COLORS["L2"]),
+        ("L2.5", "fusion\nsafe reuse", "#F7D7C8", LEVEL_COLORS["L2.5"]),
+        ("L3", "Inductor\nScheduler", "#DCEFE8", LEVEL_COLORS["L3"]),
+    ]
+    start_x, card_w, gap = 3.48, 1.55, 0.27
+    for i, (title, body, fc, ec) in enumerate(cards):
+        box(start_x + i * (card_w + gap), 3.78, card_w, 1.18,
+            title, body, fc, ec, title_size=6.2, body_size=5.0)
+    ax.text(10.42, 3.58, "PyTorch-assisted static estimate",
+            ha="center", va="top", fontsize=4.9, color=muted_col,
+            fontstyle="italic")
+
+    arrow(7.60, 6.15, 7.60, 5.70)
+    arrow(7.60, 5.70, 7.60, 5.15)
+
+    # Runtime validation path.
+    panel(0.35, 2.02, 2.50, 2.50, "Ground Truth")
+    box(0.62, 2.60, 1.96, 1.18,
+        "Runtime Profile",
+        "torch.cuda allocated\nFW / BW / OPT",
+        "#F7E8E1", "#D8A38F", title_size=6.2, body_size=5.0)
+    arrow(1.68, 6.15, 1.68, 4.52, rad=-0.02)
+
+    # Predicted/measured peaks and validation.
+    box(13.15, 4.38, 1.38, 0.92,
+        "Predicted",
+        "static peak",
+        "#EEF4FA", "#9CB8D3", title_size=6.0, body_size=5.0)
+    box(13.15, 2.72, 1.38, 0.92,
+        "Measured",
+        "runtime peak",
+        "#F7E8E1", "#D8A38F", title_size=6.0, body_size=5.0)
+    box(15.05, 3.16, 1.55, 1.64,
+        "Validation",
+        "MRE\nphase error\nCSV + F0-F9",
+        "#EEF1F5", "#AEB6BF", title_size=6.2, body_size=5.1)
+
+    arrow(12.65, 4.52, 13.15, 4.84)
+    arrow(2.58, 3.18, 13.15, 3.18, rad=0.08)
+    arrow(14.53, 4.84, 15.05, 4.30)
+    arrow(14.53, 3.18, 15.05, 3.62)
+
+    # L3 boundary note.
+    ax.plot([10.72, 12.45], [3.18, 3.18], color="#9AA0A6",
+            lw=0.75, ls="--")
+    ax.text(11.58, 2.82,
+            "L3 needs Inductor/Triton capture;\nit is not runtime profiling.",
+            ha="center", va="top", fontsize=5.0, color=muted_col,
+            linespacing=1.15)
+
+    ax.text(8.5, 0.70,
+            "Project-side static: L1 / ShapeSum / L2 / L2.5    |    "
+            "Compiler-assisted static: L3 Scheduler    |    "
+            "Ground truth: CUDA allocated runtime peak",
+            ha="center", va="center", fontsize=5.8, color=muted_col,
+            fontstyle="italic")
+
+    fig.subplots_adjust(left=0.012, right=0.988, top=0.965, bottom=0.075)
+    return fig
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  F1: Memory Composition Breakdown  (horizontal stacked bar)
 # ═══════════════════════════════════════════════════════════════════
@@ -95,14 +263,14 @@ def plot_f1_composition(rows: List[Row], fig_width: float = COLUMN_THESIS) -> pl
     comp_cols = [COMP_COLORS["param"], COMP_COLORS["grad"],
                  COMP_COLORS["optimizer"], COMP_COLORS["activation"]]
 
-    fig, ax = plt.subplots(figsize=(fig_width, 2.1), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(fig_width, 2.35), constrained_layout=False)
     y = np.arange(n)
     lefts = np.zeros(n)
 
     for idx, (cname, color) in enumerate(zip(comp_names, comp_cols)):
         vals = np.array([c[idx] for c in comps])
         ax.barh(y, vals, left=lefts, height=0.55,
-                color=color, edgecolor="none",
+                color=color, edgecolor="white", linewidth=0.35,
                 label=cname)
         for j, (v, l) in enumerate(zip(vals, lefts)):
             total = sum(comps[j])
@@ -122,7 +290,11 @@ def plot_f1_composition(rows: List[Row], fig_width: float = COLUMN_THESIS) -> pl
     ax.set_yticklabels(labels)
     ax.set_xlabel(f"Memory ({unit_label})")
     ax.set_title("Memory Composition Breakdown")
-    ax.legend(loc="upper right", ncol=2)
+    handles, labels_legend = ax.get_legend_handles_labels()
+    fig.legend(handles, labels_legend, loc="upper center",
+               bbox_to_anchor=(0.5, 0.985), ncol=4, frameon=False,
+               handlelength=1.0, handletextpad=0.35, columnspacing=1.0)
+    fig.subplots_adjust(left=0.18, right=0.95, top=0.78, bottom=0.20)
     ax.invert_yaxis()
     return fig
 
@@ -201,8 +373,8 @@ def plot_f2_strategy_overview(rows: List[Row],
                                     constrained_layout=True)
 
     # (a) Grouped vertical bar chart
-    ax1.bar(x, peaks, color=colors_bar, edgecolor="none", width=0.72)
-    ax1.grid(axis="y", alpha=0.25, lw=0.4)
+    ax1.bar(x, peaks, color=colors_bar, edgecolor="white", linewidth=0.35, width=0.72)
+    ax1.grid(axis="y")
 
     # per-group baseline dashed line + light background
     for g, (s, e, bl) in group_spans.items():
@@ -227,7 +399,7 @@ def plot_f2_strategy_overview(rows: List[Row],
     labeled_pts = []
     for i, (t, m, g, nm) in enumerate(zip(times, peaks, groups_flat, names)):
         c = GROUP_COLORS.get(g, COLORS["gray"])
-        ax2.scatter(t, m, c=c, s=64, alpha=0.85,
+        ax2.scatter(t, m, c=c, s=64, alpha=0.88,
                     edgecolors="white", linewidths=0.5, zorder=3)
         if i in front_set:
             labeled_pts.append((i, t, m, nm))
@@ -238,12 +410,12 @@ def plot_f2_strategy_overview(rows: List[Row],
         ax2.annotate(nm, (t, m), textcoords="offset points",
                      xytext=(ox, oy), fontsize=ANNOT_SIZE,
                      color="#333",
-                     arrowprops=dict(arrowstyle="-", color="#BBB",
+                     arrowprops=dict(arrowstyle="-", color="#B8BDC4",
                                      lw=0.5, shrinkB=3))
     if len(front) >= 2:
         ft = sorted([(times[i], peaks[i]) for i in front])
         ax2.plot([p[0] for p in ft], [p[1] for p in ft],
-                 color="#999", ls="--", lw=0.8, alpha=0.5, zorder=1)
+                 color="#9AA0A6", ls="--", lw=0.8, alpha=0.55, zorder=1)
     ax2.set_xlabel("Step Time (ms)")
     ax2.set_ylabel(f"Peak Memory ({unit_label})")
     ax2.set_title("(b) Memory-Time Tradeoff")
@@ -328,7 +500,7 @@ def plot_f3_peak_comparison(rows: List[Row],
     hi += margin
     diag = np.array([lo, hi])
     ax.fill_between(diag, diag * 0.9, diag * 1.1,
-                    color="#E0E0E0", alpha=0.4, zorder=0,
+                    color="#DDE4EA", alpha=0.55, zorder=0,
                     label="\u00b110%")
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
@@ -340,7 +512,7 @@ def plot_f3_peak_comparison(rows: List[Row],
                 transform=ax.transAxes, fontsize=ANNOT_SIZE,
                 va="top", ha="left",
                 bbox=dict(boxstyle="round,pad=0.3", fc="white",
-                          ec="#CCCCCC", lw=0.5, alpha=0.85))
+                          ec="#D0D5DA", lw=0.45, alpha=0.9))
 
     ax.set_xlabel(f"Runtime Peak ({unit_label})")
     ax.set_ylabel(f"Simulated Peak ({unit_label})")
@@ -401,7 +573,7 @@ def plot_f4_mre(rows: List[Row],
     # alternating row background for readability
     for i in range(n):
         if i % 2 == 0:
-            ax.axhspan(i - 0.4, i + 0.4, color="#F5F5F5", zorder=0)
+            ax.axhspan(i - 0.4, i + 0.4, color="#F6F7F9", zorder=0)
 
     for li, (lbl, key, dir_key) in enumerate(active):
         vals = [_to_float(r.get(key, 0)) * 100 for r in sim_rows]
@@ -419,7 +591,7 @@ def plot_f4_mre(rows: List[Row],
                    edgecolors="white", linewidths=0.4, zorder=4,
                    label=lbl_text)
 
-    ax.grid(axis="x", alpha=0.2, lw=0.4)
+    ax.grid(axis="x")
     ax.set_yticks(y)
     ax.set_yticklabels(names, fontsize=8)
     ax.set_xlabel("MRE (%)")
@@ -441,6 +613,10 @@ def plot_f4_mre(rows: List[Row],
 PHASE_COLORS = {"FW": COLORS["blue"], "BW": "#D55E00", "OPT": COLORS["purple"]}
 PHASE_CODE = {"FW": 0, "BW": 1, "OPT": 2}
 _OOM_COLOR = "#BDBDBD"
+_MRE_CMAP = mcolors.LinearSegmentedColormap.from_list(
+    "mre_conf",
+    ["#F8FBFD", "#DDECF6", "#8BBBD9", "#E6A34B", "#C44E52"],
+)
 
 
 def plot_f5_peak_phase_heatmap(rows: List[Row],
@@ -496,6 +672,7 @@ def plot_f5_peak_phase_heatmap(rows: List[Row],
     fig, ax = plt.subplots(figsize=(fig_width * 0.6, 0.5 * n_batch + 1.0))
 
     ax.imshow(phase_arr, cmap=cmap, norm=norm, aspect="auto")
+    _add_heatmap_grid(ax, n_opt, n_batch)
 
     ax.set_xticks(np.arange(n_opt))
     ax.set_yticks(np.arange(n_batch))
@@ -581,6 +758,7 @@ def plot_f5_merged(rows: List[Row],
                     phase_labels[bi][oi] = ph
 
         ax.imshow(phase_arr, cmap=cmap, norm=norm, aspect="auto")
+        _add_heatmap_grid(ax, n_opt, n_batch)
         ax.set_xticks(np.arange(n_opt))
         ax.set_yticks(np.arange(n_batch))
         opt_labels = [_opt_short.get(o, o) for o in optimizers]
@@ -664,7 +842,7 @@ def plot_f6_phase_stack(rows: List[Row],
                    label=plbl if oi == 0 else "")
             bottoms += vals_arr
 
-        ax.grid(axis="y", alpha=0.25, lw=0.4)
+        ax.grid(axis="y")
         ax.set_xticks(x)
         ax.set_xticklabels([str(b) for b in batches])
         ax.set_xlabel("Batch Size")
@@ -754,7 +932,7 @@ def plot_f6_merged(rows: List[Row],
             for bi in range(n_batch):
                 totals[(si, oi, bi)] = bottoms[bi]
 
-            ax.grid(axis="y", alpha=0.2, lw=0.4)
+            ax.grid(axis="y")
             ax.set_xticks(x)
             ax.set_xticklabels([str(b) for b in batches], fontsize=7)
 
@@ -846,7 +1024,8 @@ def plot_f7_model_heatmap(rows: List[Row],
                  0.5 * n_models + 1.0))
 
     vmax = max(arr.max(), 15) if arr.size > 0 else 15
-    im = ax.imshow(arr, cmap="YlOrRd", aspect="auto", vmin=0, vmax=vmax)
+    im = ax.imshow(arr, cmap=_MRE_CMAP, aspect="auto", vmin=0, vmax=vmax)
+    _add_heatmap_grid(ax, n_strats, n_models)
 
     ax.set_xticks(np.arange(n_strats))
     ax.set_yticks(np.arange(n_models))
@@ -946,8 +1125,9 @@ def plot_f7_merged(rows: List[Row],
                 si = valid_strategies.index(s)
                 arr[mi, si] = _to_float(r.get(mre_key, 0)) * 100
 
-        im = ax.imshow(arr, cmap="YlOrRd", aspect="auto",
+        im = ax.imshow(arr, cmap=_MRE_CMAP, aspect="auto",
                         vmin=0, vmax=global_vmax)
+        _add_heatmap_grid(ax, n_strats, n_models)
 
         ax.set_xticks(np.arange(n_strats))
         ax.set_yticks(np.arange(n_models))
@@ -1003,36 +1183,47 @@ def plot_f8_horizontal_methods(rows: List[Row],
     """Average MRE by simulation method.
 
     Expected keys include l1_mre, shape_sum_mre, l2_mre,
-    l25_fusion_mre, l25_safe_mre, l3_mre.
+    l25_safe_mre or l25_fusion_mre, and l3_mre.
     """
     methods = [
-        ("L1 formula", "l1_mre", COLORS["gold"]),
-        ("ShapeSum", "shape_sum_mre", COLORS["gray"]),
-        ("L2", "l2_mre", LEVEL_COLORS["L2"]),
-        ("L2.5 fusion", "l25_fusion_mre", COLORS["orange"]),
-        ("L2.5 safe", "l25_safe_mre", LEVEL_COLORS["L2.5"]),
-        ("L3", "l3_mre", LEVEL_COLORS["L3"]),
+        ("L1 formula", ("l1_mre",), COLORS["gold"]),
+        ("ShapeSum", ("shape_sum_mre",), COLORS["gray"]),
+        ("L2", ("l2_mre",), LEVEL_COLORS["L2"]),
+        ("L2.5", ("l25_safe_mre", "l25_fusion_mre"), LEVEL_COLORS["L2.5"]),
+        ("L3", ("l3_mre",), LEVEL_COLORS["L3"]),
     ]
     vals = []
-    for label, key, color in methods:
-        mres = [_to_float(r.get(key, 0)) * 100 for r in rows
-                if _to_float(r.get(key, 0)) > 0]
+    for label, keys, color in methods:
+        mres = []
+        for r in rows:
+            for key in keys:
+                value = _to_float(r.get(key, 0))
+                if value > 0:
+                    mres.append(value * 100)
+                    break
         if mres:
             vals.append((label, sum(mres) / len(mres), color, len(mres)))
 
     vals.sort(key=lambda item: item[1], reverse=True)
     fig, ax = plt.subplots(figsize=(fig_width, 3.0), constrained_layout=True)
     y = np.arange(len(vals))
-    ax.barh(y, [v for _, v, _, _ in vals], color=[c for _, _, c, _ in vals], alpha=0.85)
+    values = [v for _, v, _, _ in vals]
+    ax.barh(y, values, color=[c for _, _, c, _ in vals],
+            edgecolor="white", linewidth=0.45, alpha=0.9)
+    if values:
+        min_v = max(0.3, min(values) * 0.65)
+        max_v = max(values) * 2.2
+        ax.set_xscale("log")
+        ax.set_xlim(min_v, max_v)
     ax.axvline(10, color=COLORS["red"], ls="--", lw=1.0, alpha=0.6)
     ax.set_yticks(y)
     ax.set_yticklabels([label for label, _, _, _ in vals])
     ax.set_xlabel("Average MRE (%)")
     ax.set_title("Horizontal Method Comparison")
-    ax.grid(axis="x", alpha=0.2, lw=0.4)
+    ax.grid(axis="x", which="both")
     for yi, (_, value, _, count) in enumerate(vals):
-        ax.text(value + max(0.5, value * 0.02), yi, f"{value:.1f}%  n={count}",
-                va="center", fontsize=ANNOT_SIZE)
+        ax.text(value * 1.08, yi, f"{value:.1f}%  n={count}",
+                va="center", fontsize=ANNOT_SIZE, color="#333")
     if subtitle:
         fig.text(0.5, -0.01, subtitle, ha="center", fontsize=ANNOT_SIZE,
                  fontstyle="italic", color="#666")
@@ -1049,12 +1240,33 @@ def plot_f9_l25_ablation(rows: List[Row],
 
     Values are averaged per strategy across available models.
     """
+    safe_mre_gaps = []
+    safe_peak_deltas = []
+    total_reuses = 0
+    for row in rows:
+        fusion_mre = _to_float(row.get("l25_fusion_mre", 0))
+        safe_mre = _to_float(row.get("l25_safe_mre", 0))
+        if fusion_mre > 0 and safe_mre > 0:
+            safe_mre_gaps.append(abs(safe_mre - fusion_mre) * 100)
+        fusion_peak = _to_float(row.get("l25_fusion_true_peak", 0))
+        safe_peak = _to_float(row.get("l25_safe_true_peak", 0))
+        if fusion_peak > 0 and safe_peak > 0:
+            safe_peak_deltas.append(max(0.0, (fusion_peak - safe_peak) / MB))
+        total_reuses += int(_to_float(row.get("l25_fw_reuses", 0)))
+        total_reuses += int(_to_float(row.get("l25_bw_reuses", 0)))
+
+    max_safe_gap = max(safe_mre_gaps) if safe_mre_gaps else 0.0
+    max_safe_delta = max(safe_peak_deltas) if safe_peak_deltas else 0.0
+    show_safe_reuse = max_safe_gap >= 0.05
+
     specs = [
         ("L2", "l2_mre", LEVEL_COLORS["L2"], "o"),
         ("Fusion-only", "l25_fusion_mre", COLORS["orange"], "s"),
-        ("Safe reuse", "l25_safe_mre", LEVEL_COLORS["L2.5"], "D"),
         ("L3", "l3_mre", LEVEL_COLORS["L3"], "^"),
     ]
+    if show_safe_reuse:
+        specs.insert(2, ("Safe reuse", "l25_safe_mre", LEVEL_COLORS["L2.5"], "D"))
+
     strategies = []
     for r in rows:
         strat = r.get("strategy")
@@ -1073,24 +1285,47 @@ def plot_f9_l25_ablation(rows: List[Row],
             strategy_vals.append((strat, avg))
 
     strategy_vals.sort(key=lambda item: np.nanmean(item[1]))
-    fig, ax = plt.subplots(figsize=(fig_width, 3.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(fig_width, 3.45), constrained_layout=False)
     x = np.arange(len(strategy_vals))
     offsets = np.linspace(-0.27, 0.27, len(specs))
+    for xi, (_, avg) in enumerate(strategy_vals):
+        pts = [
+            (xi + offsets[i], avg[i])
+            for i in range(len(specs))
+            if not np.isnan(avg[i])
+        ]
+        if len(pts) >= 2:
+            xs, ys = zip(*pts)
+            ax.plot(xs, ys, color="#B8BDC4", lw=0.8, alpha=0.65, zorder=1)
     for offset, (label, _key, color, marker), idx in zip(offsets, specs, range(len(specs))):
         vals = [avg[idx] for _, avg in strategy_vals]
-        ax.scatter(x + offset, vals, color=color, marker=marker, s=42,
-                   edgecolors="white", linewidths=0.4, label=label, zorder=3)
+        ax.scatter(x + offset, vals, color=color, marker=marker, s=48,
+                   edgecolors="white", linewidths=0.5, label=label, zorder=3)
     ax.axhline(10, color=COLORS["red"], ls="--", lw=1.0, alpha=0.55)
     ax.set_xticks(x)
     ax.set_xticklabels([short_strategy_name(s) for s, _ in strategy_vals],
                        rotation=30, ha="right")
     ax.set_ylabel("MRE (%)")
     ax.set_title("L2.5 Ablation")
-    ax.grid(axis="y", alpha=0.2, lw=0.4)
-    ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
+    ax.set_ylim(bottom=0)
+    ax.grid(axis="y")
+    handles, labels_legend = ax.get_legend_handles_labels()
+    fig.legend(handles, labels_legend, loc="upper center",
+               bbox_to_anchor=(0.5, 0.955), ncol=len(specs),
+               frameon=False, handlelength=1.2, columnspacing=1.3)
+    footer_lines = []
+    if not show_safe_reuse and safe_mre_gaps:
+        footer_lines.append(
+            f"Safe reuse overlaps fusion-only: max ΔMRE={max_safe_gap:.4f} pp, "
+            f"max Δpeak={max_safe_delta:.2f} MB; reuse sites={total_reuses}"
+        )
     if subtitle:
-        fig.text(0.5, -0.01, subtitle, ha="center", fontsize=ANNOT_SIZE,
+        footer_lines.append(subtitle)
+    if footer_lines:
+        fig.text(0.5, 0.035, "\n".join(footer_lines),
+                 ha="center", va="bottom", fontsize=ANNOT_SIZE,
                  fontstyle="italic", color="#666")
+    fig.subplots_adjust(left=0.11, right=0.97, top=0.80, bottom=0.27)
     return fig
 plot_f6_mre = plot_f4_mre
 plot_f7_batch_scaling = None

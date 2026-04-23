@@ -4,6 +4,11 @@
 Compares config formula, naive graph shape-sum, L2 live-range, L2.5
 fusion-only, L2.5 safe-reuse, L3 Scheduler, and runtime profiling.
 
+Presets:
+  --quick   GPT-2 4L/256H,  B=4, S=128   (fast smoke)
+  --medium  GPT-2 8L/512H,  B=8, S=256   (stronger F8/F9 draft)
+  default   GPT-2/LLaMA/Mistral paper configs, B=8, S=512
+
 Outputs:
   toolkit_examples/outputs/ex_horizontal_comparison.csv
 """
@@ -53,6 +58,9 @@ OUTPUT_DIR = Path(__file__).with_name("outputs")
 
 QUICK_MODELS = {
     "gpt2": dict(n_layer=4, n_embd=256, n_head=4, n_inner=1024, n_positions=512),
+}
+MEDIUM_MODELS = {
+    "gpt2": dict(n_layer=8, n_embd=512, n_head=8, n_inner=2048, n_positions=1024),
 }
 PAPER_MODELS = {
     "gpt2": dict(n_embd=768, n_layer=12, n_head=12, n_inner=3072, n_positions=1024),
@@ -277,20 +285,36 @@ def run_one(registry, model_name, overrides, strategy, batch, seq, repeats, warm
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true", help="use GPT-2 quick config")
+    parser.add_argument("--medium", action="store_true", help="use stronger GPT-2 medium config")
     parser.add_argument("--batch", type=int, default=None)
     parser.add_argument("--seq", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=None)
     args = parser.parse_args()
 
+    if args.quick and args.medium:
+        raise SystemExit("--quick and --medium are mutually exclusive")
+
     if not torch.cuda.is_available():
         raise SystemExit("GPU is required for runtime horizontal comparison")
 
-    models = QUICK_MODELS if args.quick else PAPER_MODELS
-    batch = args.batch if args.batch is not None else (4 if args.quick else 8)
-    seq = args.seq if args.seq is not None else (128 if args.quick else 512)
-    repeats = args.repeats if args.repeats is not None else (1 if args.quick else 3)
-    warmup = args.warmup if args.warmup is not None else (1 if args.quick else 2)
+    if args.quick:
+        models = QUICK_MODELS
+        default_batch, default_seq = 4, 128
+        default_repeats, default_warmup = 1, 1
+    elif args.medium:
+        models = MEDIUM_MODELS
+        default_batch, default_seq = 8, 256
+        default_repeats, default_warmup = 1, 1
+    else:
+        models = PAPER_MODELS
+        default_batch, default_seq = 8, 512
+        default_repeats, default_warmup = 3, 2
+
+    batch = args.batch if args.batch is not None else default_batch
+    seq = args.seq if args.seq is not None else default_seq
+    repeats = args.repeats if args.repeats is not None else default_repeats
+    warmup = args.warmup if args.warmup is not None else default_warmup
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     registry = ModelRegistry()

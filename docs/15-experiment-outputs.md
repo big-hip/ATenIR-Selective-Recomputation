@@ -1,6 +1,6 @@
 # 15 — 实验输出说明文档
 
-> **文档定位**: 说明当前 4 个实验脚本的 CSV 输出、9 类论文图表 (F1-F9) 的读图方法和论文引用建议。
+> **文档定位**: 说明当前 4 个实验脚本的 CSV 输出、方法总览图 (F0) 与 9 类实验图表 (F1-F9) 的读图方法和论文引用建议。
 >
 > 所有输出保存在 `toolkit_examples/outputs/` 目录下。
 
@@ -19,23 +19,24 @@
 
 另有 `ex1_multi_model_capture.py` 作为 Demo（无 CSV 输出，仅控制台）。
 
-### 论文图表 (F1-F9)
+### 论文图表 (F0-F9)
 
-由 `generate_paper_figures.py` 生成，输出至 `outputs/paper_figures/`，每张图同时保存 PDF + PNG 两种格式。
+由 `generate_paper_figures.py` 生成，输出至 `outputs/paper_figures/`，默认保存 PNG。
 
 | 编号 | 内容 | 数据来源 | 文件数 |
 |------|------|---------|-------|
-| F1 | 三模型内存组成堆叠柱状图 | L1 估算 | 2 (PDF+PNG) |
-| F2 | 12 策略总览 + Pareto 图 | ex_sim_accuracy.csv | 2 |
-| F3 | RT vs L2 vs L2.5 vs L3 分组柱状图 | ex_sim_accuracy.csv | 2 |
-| F4 | L2/L2.5/L3 MRE 对比 | ex_sim_accuracy.csv | 2 |
-| F5 | 峰值阶段 merged 热力图 | ex_peak_phase.csv | 2 |
-| F6 | FW/BW/OPT merged 阶段堆叠图 | ex_peak_phase.csv | 2 |
-| F7 | 模型×策略×层级 merged MRE 热力图 | ex_model_generalization.csv | 2 |
-| F8 | 横向方法平均 MRE 对比 | ex_horizontal_comparison.csv | 2 |
-| F9 | L2 → fusion-only → safe-reuse → L3 消融 | ex_horizontal_comparison.csv | 2 |
+| F0 | 方法总览：策略注入、图捕获、ShapeSum/L1/L2/L2.5/L3、runtime profile | 代码结构示意 | 1 |
+| F1 | 三模型内存组成堆叠柱状图 | L1 估算 | 1 |
+| F2 | 12 策略总览 + Pareto 图 | ex_sim_accuracy.csv | 1 |
+| F3 | RT vs L2 vs L2.5 vs L3 分组柱状图 | ex_sim_accuracy.csv | 1 |
+| F4 | L2/L2.5/L3 MRE 对比 | ex_sim_accuracy.csv | 1 |
+| F5 | 峰值阶段 merged 热力图 | ex_peak_phase.csv | 1 |
+| F6 | FW/BW/OPT merged 阶段堆叠图 | ex_peak_phase.csv | 1 |
+| F7 | 模型×策略×层级 merged MRE 热力图 | ex_model_generalization.csv | 1 |
+| F8 | 横向方法平均 MRE 对比 | ex_horizontal_comparison.csv | 1 |
+| F9 | L2 → fusion-only → safe-reuse → L3 消融 | ex_horizontal_comparison.csv | 1 |
 
-共 18 个文件（若缺少 `ex_horizontal_comparison.csv`，F8/F9 会跳过）。
+共 10 个 PNG 文件（若缺少 `ex_horizontal_comparison.csv`，F8/F9 会跳过）。
 
 ---
 
@@ -65,7 +66,8 @@
 **关键特征**:
 - G1 策略（eager）：有运行时数据，**无仿真数据**（不经过 torch.compile）
 - G2 aot_eager 策略：输出 L2，通常无 L2.5/L3
-- G2/G3 inductor 策略：输出 L2/L2.5/L3。2026-04-23 修复后旧 CSV 的 L2.5 MRE 不再作为论文结论，需要在 GPU 可见环境下重跑
+- G2/G3 inductor 策略：输出 L2/L2.5/L3。2026-04-23 新数据中，L2 平均 MRE 8.0%，L2.5 平均 MRE 4.9%，L3 平均 MRE 9.1%
+- S09 `inductor(b=0.0)` 是重计算最强的极端场景：L2 MRE 18.5%，L2.5 6.3%，L3 1.7%，可作为 L3 Scheduler 价值的重点例子
 
 ### ex_peak_phase.csv — 峰值阶段分析
 
@@ -106,12 +108,15 @@
 **关键特征**:
 - eager 策略：仅有运行时数据（无仿真值）
 - aot_eager 策略：L2 MRE 随架构差异较大（GPT-2 较高，LLaMA 较低）
-- inductor 策略：L2.5 和 L3 显著优于 L2
+- inductor 策略：L2.5 和 L3 整体优于 L2；2026-04-23 新数据中 overall L2/L2.5/L3 平均 MRE 分别为 8.4% / 7.0% / 7.0%
 
 ### ex_horizontal_comparison.csv — 横向方法对比
 
 **quick 配置**: GPT-2 4L/256H, B=4, S=128。
+**medium 配置**: GPT-2 8L/512H, B=8, S=256。
 **paper 配置**: GPT-2/LLaMA/Mistral 放大配置, B=8, S=512, Adam(fused=True)。
+
+推荐用 medium 配置生成 F8/F9：比 quick 更接近论文规模，又避免 paper 三模型横向实验耗时过长。若要把 F8/F9 作为强定量结论，可进一步运行 paper 配置。
 
 | 字段 | 含义 |
 |------|------|
@@ -128,11 +133,21 @@
 
 `ShapeSum_graph` 只是 naive shape-inference baseline：非 view tensor shape bytes 总和 + static base，不做 live-range，不宣称复现 DNNMem/LLMem/xMem。
 
+2026-04-23 medium 横向结果：L1 平均 MRE 38.8%，ShapeSum 315.1%，L2 8.5%，L2.5 fusion/safe 10.6%，L3 5.4%。ShapeSum 系统性 over，适合作为"没有 live-range 会严重高估"的对照。
+
 ---
 
-## 三、论文图表 (F1-F9) 详细说明
+## 三、论文图表 (F0-F9) 详细说明
 
-### F1: Memory Composition — `F1_composition.{pdf,png}`
+### F0: Method Overview — `F0_method_overview.png`
+
+- **类型**: System Pipeline Diagram
+- **数据来源**: 代码结构示意，无 CSV
+- **含义**: 展示从模型与重计算策略，到 AOT/Inductor 图捕获，再到 ShapeSum/L1/L2/L2.5/L3 静态估算与 runtime profile 验证的完整链路
+- **读图方法**: L1/ShapeSum/L2/L2.5 是项目侧静态估算；L3 使用 PyTorch Inductor Scheduler peak，是 compiler-assisted static estimate；runtime profile 是真实测量 ground truth
+- **论文用途**: 方法章节开头，用来解释系统架构和各层级估算口径
+
+### F1: Memory Composition — `F1_composition.png`
 
 - **类型**: Stacked Bar Chart（三根柱子 = 三个模型）
 - **含义**: 对 GPT-2 124M / LLaMA ~870M / Mistral ~550M，将 L1 估算的训练峰值内存分解为 param / grad / optimizer / activation 四部分
@@ -140,7 +155,7 @@
 - **读图方法**: 柱子总高度 = 估算训练峰值。红色（activation）部分越大，重计算策略的潜在收益越大
 - **论文用途**: 第 3 章开篇，展示不同架构的内存组成差异，引出"activation 是主要优化目标"
 
-### F2: Strategy Overview — `F2_strategy_overview.{pdf,png}`
+### F2: Strategy Overview — `F2_strategy_overview.png`
 
 - **类型**: 双子图（上: 柱状图 12 策略峰值 + Pareto 散点图）
 - **数据来源**: `ex_sim_accuracy.csv`
@@ -148,7 +163,7 @@
 - **副标题**: "LLaMA ~870M | B=8, S=512 | Adam (fused)"
 - **论文用途**: §5.1 核心图，一图总览全部策略的内存效率排名 + Pareto 前沿
 
-### F3: Peak Comparison — `F3_peak_comparison.{pdf,png}`
+### F3: Peak Comparison — `F3_peak_comparison.png`
 
 - **类型**: Grouped Bar Chart（每策略最多 4 根柱: RT / L2 / L2.5 / L3）
 - **数据来源**: `ex_sim_accuracy.csv`
@@ -156,7 +171,7 @@
 - **读图方法**: 柱子越接近运行时（深色）= 仿真越准确。L2.5/L3 柱通常比 L2 柱更接近 RT
 - **论文用途**: §5.1 第二张图，直观展示四层仿真的精度差异
 
-### F4: MRE — `F4_mre.{pdf,png}`
+### F4: MRE — `F4_mre.png`
 
 - **类型**: Grouped Bar Chart（每策略最多 3 根柱: L2 MRE / L2.5 MRE / L3 MRE）
 - **数据来源**: `ex_sim_accuracy.csv`
@@ -164,7 +179,7 @@
 - **读图方法**: 柱子越矮 = 误差越小。aot_eager 策略 L2 已足够准确；inductor 策略需要 L2.5/L3 才能达到可用精度
 - **论文用途**: §5.1 精度分析的核心数据图
 
-### F5: Peak Phase Heatmap — `F5_peak_phase_merged.{pdf,png}`
+### F5: Peak Phase Heatmap — `F5_peak_phase_merged.png`
 
 - **类型**: Heatmap，X = batch size，Y = optimizer
 - **布局**: 多策略 merged 子图
@@ -174,7 +189,7 @@
 - **读图方法**: 红色区域（OPT 瓶颈）集中在 Adam + 小 batch。Adam(fused) 的 OPT 红色通常消失。AC 策略整体偏 FW
 - **论文用途**: §5.2 核心图，展示"何时 OPT 成为瓶颈"的完整矩阵
 
-### F6: Phase Stack — `F6_phase_stack_merged.{pdf,png}`
+### F6: Phase Stack — `F6_phase_stack_merged.png`
 
 - **类型**: Stacked Bar Chart，按 batch×optimizer 分组
 - **布局**: 代表性策略 merged 子图
@@ -183,7 +198,7 @@
 - **读图方法**: 三层堆叠中最高的色块 = 该阶段占据的峰值份额。batch 增大 → FW 层增厚；SGD → OPT 层很薄
 - **论文用途**: §5.2 辅助图，展示峰值的阶段组成变化趋势
 
-### F7: Model Heatmap — `F7_model_heatmap_merged.{pdf,png}`
+### F7: Model Heatmap — `F7_model_heatmap_merged.png`
 
 - **类型**: Heatmap，X = 策略，Y = 模型
 - **布局**: l2 / l25 / l3 多层 merged 子图
@@ -194,20 +209,20 @@
 - **读图方法**: 比较同一行（同模型）不同策略的精度差异；比较同一列（同策略）不同模型的精度差异
 - **论文用途**: §5.3 核心图，证明仿真精度的架构通用性
 
-### F8: Horizontal Methods — `F8_horizontal_methods.{pdf,png}`
+### F8: Horizontal Methods — `F8_horizontal_methods.png`
 
 - **类型**: Horizontal Bar Chart
 - **数据来源**: `ex_horizontal_comparison.csv`
-- **含义**: 汇总 L1 / ShapeSum / L2 / L2.5 fusion-only / L2.5 safe-reuse / L3 的平均 MRE
-- **读图方法**: 越短越准确；ShapeSum 是 naive baseline，用于说明 live-range 的必要性
+- **含义**: 汇总 L1 / ShapeSum / L2 / L2.5 / L3 的平均 MRE；L2.5 优先采用 safe-reuse 字段，缺失时回退到 fusion-only
+- **读图方法**: 越短越准确；横轴使用 log scale，避免 ShapeSum 的大误差压扁 L2/L2.5/L3；ShapeSum 是 naive baseline，用于说明 live-range 的必要性
 - **论文用途**: §5.4 横向方法对比，补足"只纵向比较本方法层级"的不足
 
-### F9: L2.5 Ablation — `F9_l25_ablation.{pdf,png}`
+### F9: L2.5 Ablation — `F9_l25_ablation.png`
 
 - **类型**: Scatter Ablation Chart
 - **数据来源**: `ex_horizontal_comparison.csv`
-- **含义**: 对每个策略展示 L2 → fusion-only → safe-reuse → L3 的误差变化
-- **读图方法**: 检查 fusion 与 safe reuse 各自贡献，并观察 L3 是否进一步贴近 Runtime
+- **含义**: 对每个策略展示 L2 → L2.5 fusion-only → safe-reuse（若有可见差异）→ L3 的误差变化
+- **读图方法**: 检查 fusion 对 L2 的修正，以及 L3 是否进一步贴近 Runtime；当前 medium 数据中 safe-reuse 与 fusion-only 基本重合，图内会标注最大差异与 reuse 次数
 - **论文用途**: §5.4 消融实验，解释 L2.5 的两个组成部分
 
 ---

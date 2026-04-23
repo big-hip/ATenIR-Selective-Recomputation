@@ -7,10 +7,10 @@
 **实测精度** (LLaMA ~870M, B=8, S=512, Adam fused, 12 种策略):
 
 | 仿真层级 | 方法 | 代表性 MRE |
-|---------|------|-----------|
-| **L2** | ATen IR 图遍历 | 0.01% ~ 18.9% (均值 8.8%) |
-| **L2.5** | 融合感知图遍历 | 0.4% ~ 13.2% |
-| **L3** | Inductor Scheduler | 0.8% ~ 19.6% |
+|---------|------|----------|
+| **L2** | ATen IR 图遍历 | 1.9% ~ 18.5% (均值 8.0%) |
+| **L2.5** | 融合感知图遍历 | 1.9% ~ 9.0% (均值 4.9%) |
+| **L3** | Inductor Scheduler | 0.9% ~ 19.7% (均值 9.1%) |
 
 ---
 
@@ -52,7 +52,7 @@ python toolkit_examples/ex_peak_phase.py
 # 实验 3: 多模型通用性验证（GPT-2 / LLaMA / Mistral × 6 策略）
 python toolkit_examples/ex_model_generalization.py
 
-# 生成论文图表（F1-F7, PDF+PNG）
+# 生成论文图表（F0-F9, PNG）
 python toolkit_examples/generate_paper_figures.py
 
 # 运行全部测试
@@ -90,7 +90,7 @@ ATenIR-Selective-Recomputation/
 │   │   ├── console.py              #     表格打印
 │   │   ├── charts.py               #     交互图表
 │   │   ├── export.py               #     CSV/JSON 导出
-│   │   ├── pub_charts.py           #     论文图表 (F1-F7)
+│   │   ├── pub_charts.py           #     论文图表 (F0-F9)
 │   │   └── pub_style.py            #     论文样式
 │   └── utils/                      #   工具函数
 │       ├── view_ops.py             #     is_view_node (storage aliasing)
@@ -104,10 +104,10 @@ ATenIR-Selective-Recomputation/
 │   ├── ex_sim_accuracy.py          #   实验 1: 12 策略仿真精度
 │   ├── ex_peak_phase.py            #   实验 2: 峰值阶段分析
 │   ├── ex_model_generalization.py  #   实验 3: 多模型通用性
-│   ├── generate_paper_figures.py   #   论文图表 (F1-F7)
-│   └── outputs/                    #   CSV + PDF/PNG 输出 (gitignored)
+│   ├── generate_paper_figures.py   #   论文图表 (F0-F9)
+│   └── outputs/                    #   论文 CSV + PNG 输出
 │
-├── tests/                          # 测试 (10 文件, 85 tests)
+├── tests/                          # 测试 (10 文件, 95 tests)
 ├── docs/                           # 项目文档 (18 篇)
 ├── requirements.txt
 ├── Dockerfile
@@ -142,12 +142,12 @@ L3:    同 L2.5，额外 hook Inductor Scheduler 的 estimate_peak_memory
 
 | 策略 | Runtime | L2 MRE | L2.5 MRE | L3 MRE |
 |------|---------|--------|----------|--------|
-| S05 aot_eager+default | 29.2 GB | **0.01%** | — | — |
-| S07 inductor(b=1.0) | 23.5 GB | 1.8% | **0.4%** | 13.3% |
-| S08 inductor(b=0.5) | 17.9 GB | 4.5% | **1.6%** | 19.6% |
-| S09 inductor(b=0.0) | 23.8 GB | 18.9% | 27.3% | **1.6%** |
-| S11 ac+inductor | 16.1 GB | 13.2% | 13.2% | **9.7%** |
-| S12 sac_mm+inductor | 21.1 GB | 2.9% | **0.4%** | 0.8% |
+| S05 aot_eager+default | 29.2 GB | **3.7%** | — | — |
+| S07 inductor(b=1.0) | 23.5 GB | 1.9% | **1.9%** | 13.4% |
+| S08 inductor(b=0.5) | 17.9 GB | 4.6% | **4.6%** | 19.7% |
+| S09 inductor(b=0.0) | 23.8 GB | 18.5% | **6.3%** | 1.7% |
+| S11 ac+inductor | 16.1 GB | 8.4% | 9.0% | **9.6%** |
+| S12 sac_mm+inductor | 21.1 GB | 3.0% | **3.0%** | 0.9% |
 
 ### 实验 2: 峰值阶段分析
 
@@ -171,6 +171,7 @@ python toolkit_examples/generate_paper_figures.py
 
 | 编号 | 内容 | 数据来源 |
 |------|------|---------|
+| F0 | 方法总览图（含 ShapeSum/L1/L2/L2.5/L3 与 runtime profile） | 代码结构示意 |
 | F1 | 三模型内存组成堆叠柱状图 | L1 估算 |
 | F2 | 12 策略总览 + Pareto 图 | ex_sim_accuracy.csv |
 | F3 | RT vs L2 vs L2.5 vs L3 分组柱状图 | ex_sim_accuracy.csv |
@@ -178,14 +179,16 @@ python toolkit_examples/generate_paper_figures.py
 | F5 | 峰值阶段热力图 | ex_peak_phase.csv |
 | F6 | FW/BW/OPT 三阶段堆叠柱状图 | ex_peak_phase.csv |
 | F7 | 模型 × 策略 MRE 热力图 | ex_model_generalization.csv |
+| F8 | 横向方法对比 (L1→L2→L2.5→L3) | ex_horizontal_comparison.csv |
+| F9 | L2.5 消融实验 | ex_horizontal_comparison.csv |
 
 ---
 
 ## 测试
 
 ```bash
-python -m pytest tests/ -x -q                    # 全部 85 tests
-python -m pytest tests/ -x -q -k "not inductor"  # 跳过 GPU 测试
+python -m pytest tests/ -x -q                    # 全部 95 tests
+python -m pytest tests/ -x -q -m "not inductor"  # 跳过 Inductor/Triton 慢测试
 ```
 
 ---

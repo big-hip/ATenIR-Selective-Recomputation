@@ -28,7 +28,7 @@
                    ▼
             ┌──────────────┐
             │  Pillar 4    │  profiler/: GPU 运行时 ground truth
-            │  验证层       │  output/: 表格 + 图表 + CSV + 论文图表(F1-F9)
+            │  验证层       │  output/: 表格 + 图表 + CSV + 论文图表(F0-F9)
             └──────────────┘
 ```
 
@@ -107,7 +107,7 @@ ATenIR-Selective-Recomputation/
 │   │   ├── console.py           # tabulate 表格 (print_comparison_table, ...)
 │   │   ├── charts.py            # matplotlib 交互图表 (7 种)
 │   │   ├── export.py            # to_csv / to_json
-│   │   ├── pub_charts.py        # 论文图表 (F1-F9: plot_f1..plot_f9)
+│   │   ├── pub_charts.py        # 论文图表 (F0-F9: plot_f0..plot_f9)
 │   │   └── pub_style.py         # paper_style + savefig_pub
 │   └── utils/                   # 共享工具
 │       ├── view_ops.py          # is_view_node() — storage aliasing via _cdata
@@ -120,7 +120,7 @@ ATenIR-Selective-Recomputation/
 │   ├── ex_peak_phase.py               # 实验 2: batch×optimizer 峰值阶段
 │   ├── ex_model_generalization.py     # 实验 3: 多模型通用性
 │   ├── ex_horizontal_comparison.py    # 实验 4: 横向方法对比
-│   └── generate_paper_figures.py      # 论文图表 F1-F9
+│   └── generate_paper_figures.py      # 论文图表 F0-F9
 ├── tests/                       # pytest 回归测试
 └── docs/                        # 本文档集 (17 篇)
 ```
@@ -299,7 +299,7 @@ measure_step/measure_phased("run", forward_fn, optimizer)  → StepResult/PhaseR
 validate(static_result, runtime_result, run_mode="compiled")  → ValidationResult
     │
     ▼
-output/: console table + charts + CSV + 论文图表 (F1-F9)
+output/: console table + charts + CSV + 论文图表 (F0-F9)
 ```
 
 > **loss_fn 贯穿路径**: ModelSpec → capture_graphs → measure_step → validate。
@@ -389,12 +389,13 @@ L3 直接复用 Inductor 的 `Scheduler.estimate_peak_memory()` 方法：
 
 | Level | 方法 | aot_eager MRE | inductor MRE | 对标工具 |
 |-------|------|-------------|-------------|----------|
-| **L1** | Config 公式推导 | 15-25% | — | 公式基线 |
-| **L2** | FX 图遍历 + 512B | **1-7%** | 28-38% (不建模 fusion) | — |
-| **L2.5** | + fusion-only / safe-reuse | — | 待重跑 | — |
-| **L3** | + Scheduler hook | — | 待重跑 | Inductor 内部 |
+| **L1** | Config 公式推导 | 横向 medium 平均 38.8% | 同左 | 公式基线 |
+| **ShapeSum** | 图 tensor shape 总和 | 横向 medium 平均 315.1% | 同左 | naive baseline |
+| **L2** | FX 图遍历 + 512B | 主实验 AOT 约 3.7-13.5% | 主实验 Inductor 平均 7.3% | — |
+| **L2.5** | + fusion-only / safe-reuse | — | 主实验平均 4.9%，泛化平均 7.0% | — |
+| **L3** | + Scheduler hook | — | 主实验平均 9.1%，泛化平均 7.0% | Inductor 内部 |
 
-> L2 在 aot_eager 后端已达到较高精度；inductor 后端需要 L2.5/L3 才能达到可用精度。旧 CSV 的 L2.5 MRE 使用过宽融合口径，当前修复后需重新运行主实验。
+> L2 在 aot_eager 后端已达到较高精度；Inductor 后端需要 L2.5/L3 才能稳定建模 fusion/reuse。当前数值来自 2026-04-23 重跑后的 CSV；旧 CSV 仅作历史参考。
 > 详见 `15-experiment-outputs.md` 和 `ex_sim_accuracy.csv`。
 
 ---
@@ -472,7 +473,7 @@ L3 直接复用 Inductor 的 `Scheduler.estimate_peak_memory()` 方法：
 | **4** | simulation/ | L2 MRE=2.2%(eager)→6.6%(compiled)→**6.9%**(B10修后) | 见 04-dev-log |
 | **5** | strategy/ | AC -12~25%, min_cut -12~20%, MRE 7.5% | 见 04-dev-log |
 | **6** | profiler/ | `measure_phased` + `validate` + `analyze_error_sources` | 见 04-dev-log |
-| **7** | output/ | console + charts + export + pub_charts (F1-F9) + pub_style | 见 04-dev-log |
+| **7** | output/ | console + charts + export + pub_charts (F0-F9) + pub_style | 见 04-dev-log |
 
 > 详细实验数据见 `docs/15-experiment-outputs.md` 和 `toolkit_examples/outputs/` 下的 CSV 文件。
 

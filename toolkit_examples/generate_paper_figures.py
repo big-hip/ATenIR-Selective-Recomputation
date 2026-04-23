@@ -6,13 +6,14 @@ Usage::
     python toolkit_examples/generate_paper_figures.py
 
 Output directory: toolkit_examples/outputs/paper_figures/
-Formats: PDF (vector) + PNG (300 dpi raster)
+Format: PNG (300 dpi raster)
 
 Prerequisites: run ex_sim_accuracy, ex_peak_phase, ex_model_generalization,
 and optionally ex_horizontal_comparison first to populate the CSV/data files.
 Missing CSVs are skipped gracefully.
 
 Figure mapping:
+  F0: Method Overview Pipeline             — no CSV
   F1: Memory Composition Breakdown        — from L1 config estimation (no CSV)
   F2: 12-Strategy Overview + Pareto        — from ex_sim_accuracy.csv
   F3: Multi-Level Peak Comparison          — from ex_sim_accuracy.csv
@@ -25,8 +26,11 @@ Figure mapping:
 """
 
 import csv
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -41,6 +45,7 @@ import matplotlib.pyplot as plt
 
 from toolkit.output.pub_style import paper_style, savefig_pub, MB
 from toolkit.output.pub_charts import (
+    plot_f0_method_overview,
     plot_f1_composition,
     plot_f2_strategy_overview,
     plot_f3_peak_comparison,
@@ -82,6 +87,15 @@ def _load_csv(name: str):
                 except (ValueError, TypeError):
                     pass
     return rows
+
+
+# ── F0: Method Overview ──────────────────────────────────────────
+def _gen_f0():
+    """F0: Method overview pipeline."""
+    fig = plot_f0_method_overview()
+    savefig_pub(fig, OUT_DIR / "F0_method_overview")
+    plt.close(fig)
+    print("  [OK] F0_method_overview")
 
 
 # ── F1: Memory Composition ───────────────────────────────────────
@@ -224,6 +238,16 @@ def _gen_f7():
     print("  [OK] F7_model_heatmap_merged")
 
 
+def _horizontal_subtitle(rows):
+    models = sorted({str(r.get("model", "?")) for r in rows if r.get("model")})
+    batches = sorted({str(r.get("batch", "?")) for r in rows if r.get("batch") is not None})
+    seqs = sorted({str(r.get("seq", "?")) for r in rows if r.get("seq") is not None})
+    model_part = "/".join(models) if len(models) <= 3 else f"{len(models)} models"
+    batch_part = ",".join(batches) if len(batches) <= 3 else f"{len(batches)} batches"
+    seq_part = ",".join(seqs) if len(seqs) <= 3 else f"{len(seqs)} seq lengths"
+    return f"{model_part}  |  B={batch_part}, S={seq_part}  |  n={len(rows)} strategies"
+
+
 # ── F8: Horizontal Method Comparison ─────────────────────────────
 def _gen_f8():
     """F8: Average MRE across L1/ShapeSum/L2/L2.5/L3 methods."""
@@ -238,7 +262,7 @@ def _gen_f8():
 
     fig = plot_f8_horizontal_methods(
         valid,
-        subtitle="quick or paper config from ex_horizontal_comparison",
+        subtitle=_horizontal_subtitle(valid),
     )
     savefig_pub(fig, OUT_DIR / "F8_horizontal_methods")
     plt.close(fig)
@@ -259,7 +283,7 @@ def _gen_f9():
 
     fig = plot_f9_l25_ablation(
         valid,
-        subtitle="quick or paper config from ex_horizontal_comparison",
+        subtitle=_horizontal_subtitle(valid),
     )
     savefig_pub(fig, OUT_DIR / "F9_l25_ablation")
     plt.close(fig)
@@ -279,6 +303,7 @@ def main():
     print("=" * 60)
 
     with paper_style():
+        _gen_f0()
         _gen_f1()
         _gen_f2()
         _gen_f3()

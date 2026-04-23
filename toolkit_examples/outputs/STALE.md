@@ -1,7 +1,10 @@
-# Stale Experiment Outputs
+# Experiment Outputs — Updated 2026-04-23
 
-The CSV files in this directory that predate the 2026-04-23 simulation fixes
-are kept only as historical references. Do not use their L2.5 MRE values as
-current paper results until the GPU experiments are rerun.
+All four CSVs have been re-run with the latest simulation code (2026-04-23):
+- ex_sim_accuracy.csv       (07:39)
+- ex_peak_phase.csv         (08:31)
+- ex_model_generalization.csv (09:30)
+- ex_horizontal_comparison.csv (06:39)
 
-Historical copies are also available under `test_old/`.
+Paper figures (F1-F9) regenerated from the above.
+Historical pre-fix copies are preserved under `test_old/`.
